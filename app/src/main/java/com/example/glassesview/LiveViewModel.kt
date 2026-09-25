@@ -1,10 +1,11 @@
 package com.example.glassesview
 
+import android.app.Application
 import android.content.Context
 import android.graphics.Bitmap
 import android.os.SystemClock
 import android.util.Log
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.meta.wearable.dat.camera.Camera
 import com.meta.wearable.dat.camera.addCamera
@@ -42,6 +43,25 @@ enum class Phase {
   Paused,
 }
 
+/** What the user picks on the camera screen. Applied when the camera is opened. */
+data class StreamSettings(
+    val quality: VideoQuality = VideoQuality.MEDIUM,
+    val fps: Int = 24,
+    val bufferMs: Long = 200,
+) {
+  companion object {
+    // Portrait frame sizes the SDK streams at each quality.
+    val QUALITIES =
+        linkedMapOf(
+            VideoQuality.LOW to (360 to 640),
+            VideoQuality.MEDIUM to (504 to 896),
+            VideoQuality.HIGH to (720 to 1280),
+        )
+    val FRAME_RATES = listOf(15, 24, 30) // the SDK also accepts 2 and 7
+    val BUFFERS = listOf(100L, 200L, 300L)
+  }
+}
+
 data class LiveUiState(
     val sdkReady: Boolean = false,
     val bluetoothDenied: Boolean = false,
@@ -64,21 +84,29 @@ data class LiveUiState(
         }
 }
 
-class LiveViewModel : ViewModel() {
+class LiveViewModel(application: Application) : AndroidViewModel(application) {
 
   companion object {
     private const val TAG = "GlassesView"
-
-    // MEDIUM (504x896) holds up best over Bluetooth. HIGH is 720x1280, LOW is 360x640.
-    private val QUALITY = VideoQuality.MEDIUM
-    private const val FPS = 24 // valid: 2, 7, 15, 24, 30
-
-    // Extra delay that absorbs Bluetooth bunching. Higher is smoother, lower is more live.
-    private const val PLAYOUT_DELAY_MS = 250L
   }
 
   private val _ui = MutableStateFlow(LiveUiState())
   val ui: StateFlow<LiveUiState> = _ui.asStateFlow()
+
+  private val prefs = application.getSharedPreferences("stream_settings", Context.MODE_PRIVATE)
+  private val _settings =
+      MutableStateFlow(
+          StreamSettings(
+              quality =
+                  VideoQuality.entries.firstOrNull { it.name == prefs.getString("quality", null) }
+                      ?: VideoQuality.MEDIUM,
+              fps = prefs.getInt("fps", 24),
+              bufferMs = prefs.getLong("bufferMs", 200),
+          ))
+  val settings: StateFlow<StreamSettings> = _settings.asStateFlow()
+
+  // Settings the open camera is using; changes on the camera screen apply next time it opens.
+  private var opened = StreamSettings()
 
   private val converter = I420Converter()
   private val _frames = MutableStateFlow<Bitmap?>(null)
@@ -86,9 +114,15 @@ class LiveViewModel : ViewModel() {
   /** The latest frame to draw, published at its playback time. */
   val frames: StateFlow<Bitmap?> = _frames.asStateFlow()
 
+  // The session with the glasses stays open between camera views and only the camera is added and
+  // removed. Ending a session makes the SDK report the glasses as disconnected for a while, which
+  // would fail the next open.
   private var session: DeviceSession? = null
+  private var sessionStarted = false
+  private val sessionJobs = mutableListOf<Job>()
   private var camera: Camera? = null
-  private val jobs = mutableListOf<Job>()
+  private var wantCamera = false
+  private val cameraJobs = mutableListOf<Job>()
 
   fun initialize(context: Context) {
     if (_ui.value.sdkReady) return
@@ -109,6 +143,17 @@ class LiveViewModel : ViewModel() {
         .onFailure { error, _ -> _ui.update { it.copy(message = error.description) } }
   }
 
+  fun updateSettings(change: (StreamSettings) -> StreamSettings) {
+    val next = change(_settings.value)
+    _settings.value = next
+    prefs
+        .edit()
+        .putString("quality", next.quality.name)
+        .putInt("fps", next.fps)
+        .putLong("bufferMs", next.bufferMs)
+        .apply()
+  }
+
   fun showMessage(message: String) {
     _ui.update { it.copy(message = message) }
   }
@@ -118,22 +163,47 @@ class LiveViewModel : ViewModel() {
   }
 
   fun goLive(requestCameraPermission: suspend () -> PermissionStatus) {
-    if (session != null) return
+    if (_ui.value.streaming != null) return
+    wantCamera = true
     _ui.update {
       it.copy(streaming = Phase.Connecting, glassesUpdateRequired = false, message = null)
     }
     viewModelScope.launch {
-      val current =
-          Wearables.checkPermissionStatus(Permission.CAMERA).getOrDefault(PermissionStatus.Denied)
-      val granted =
-          current == PermissionStatus.Granted ||
-              requestCameraPermission() == PermissionStatus.Granted
-      if (granted) openSession() else fail("Camera access wasn't allowed in Meta AI.")
+      var status: PermissionStatus? = null
+      var problem: String? = null
+      Wearables.checkPermissionStatus(Permission.CAMERA)
+          .onSuccess { status = it }
+          .onFailure { error, _ -> problem = error.description }
+      val reason = problem
+      when {
+        // The check fails when the glasses are asleep or disconnected. That isn't a denial, so
+        // don't send the user to Meta AI for a permission they may already have granted.
+        reason != null -> fail("Couldn't reach your glasses: $reason")
+        status == PermissionStatus.Granted -> startCamera()
+        requestCameraPermission() == PermissionStatus.Granted -> startCamera()
+        else -> fail("Camera access wasn't allowed in Meta AI.")
+      }
     }
   }
 
+  /** Closes the camera but keeps the session with the glasses, so it can reopen straight away. */
   fun stop() {
-    teardown()
+    closeCamera()
+  }
+
+  /** The app left the screen: don't keep streaming in the background. */
+  fun onBackground() {
+    if (camera != null) closeCamera()
+  }
+
+  private fun startCamera() {
+    if (!wantCamera) return // closed while waiting for permission
+    val current = session
+    when {
+      current == null -> openSession()
+      sessionStarted && camera == null -> attachCamera(current)
+      else -> Unit // still starting; the session's state collector attaches the camera
+    }
   }
 
   private fun openSession() {
@@ -142,27 +212,26 @@ class LiveViewModel : ViewModel() {
             onSuccess = { created ->
               session = created
               // Subscribe before start() so no transition is missed.
-              jobs += viewModelScope.launch {
+              sessionJobs += viewModelScope.launch {
                 created.errors.collect { error ->
                   if (error == DeviceSessionError.DAT_APP_ON_THE_GLASSES_UPDATE_REQUIRED) {
                     // The toolkit app on the glasses is missing or too old; Meta AI installs it.
                     Log.w(TAG, error.description)
-                    teardown()
+                    endSession()
                     _ui.update { it.copy(glassesUpdateRequired = true, message = null) }
                   } else {
                     fail(error.description)
                   }
                 }
               }
-              jobs += viewModelScope.launch {
-                var started = false
+              sessionJobs += viewModelScope.launch {
                 created.state.collect { state ->
                   when (state) {
                     DeviceSessionState.STARTED -> {
-                      started = true
-                      if (camera == null) attachCamera(created)
+                      sessionStarted = true
+                      if (wantCamera && camera == null) attachCamera(created)
                     }
-                    DeviceSessionState.STOPPED -> if (started) teardown()
+                    DeviceSessionState.STOPPED -> if (sessionStarted) endSession()
                     else -> Unit
                   }
                 }
@@ -174,14 +243,15 @@ class LiveViewModel : ViewModel() {
   }
 
   private fun attachCamera(session: DeviceSession) {
+    opened = _settings.value
     session
-        .addCamera(StreamConfiguration(videoQuality = QUALITY, frameRate = FPS))
+        .addCamera(StreamConfiguration(videoQuality = opened.quality, frameRate = opened.fps))
         .fold(
             onSuccess = { added ->
               camera = added
               val stream = added.stream
               val buffer = Channel<TimedFrame>(64, BufferOverflow.DROP_OLDEST)
-              jobs += viewModelScope.launch(Dispatchers.Default) {
+              cameraJobs += viewModelScope.launch(Dispatchers.Default) {
                 stream.videoStream.collect { frame ->
                   if (frame.isCompressed) return@collect
                   // Copy out of the SDK's buffer, which it may reuse after this returns.
@@ -191,8 +261,9 @@ class LiveViewModel : ViewModel() {
                       TimedFrame(bytes, frame.width, frame.height, frame.presentationTimeUs / 1000))
                 }
               }
-              jobs += viewModelScope.launch(Dispatchers.Default) { playOut(buffer) }
-              jobs += viewModelScope.launch {
+              val bufferMs = opened.bufferMs
+              cameraJobs += viewModelScope.launch(Dispatchers.Default) { playOut(buffer, bufferMs) }
+              cameraJobs += viewModelScope.launch {
                 var active = false
                 stream.state.collect { state ->
                   when (state) {
@@ -202,12 +273,12 @@ class LiveViewModel : ViewModel() {
                     }
                     StreamState.PAUSED -> _ui.update { it.copy(streaming = Phase.Paused) }
                     StreamState.STOPPED,
-                    StreamState.CLOSED -> if (active) teardown()
+                    StreamState.CLOSED -> if (active) closeCamera()
                     else -> Unit
                   }
                 }
               }
-              jobs += viewModelScope.launch {
+              cameraJobs += viewModelScope.launch {
                 stream.errorStream.collect { error ->
                   Log.w(TAG, "Stream error: ${error.description}")
                   _ui.update { it.copy(message = error.description) }
@@ -223,20 +294,20 @@ class LiveViewModel : ViewModel() {
 
   /**
    * Jitter buffer. Frames leave the glasses at a steady rate but arrive over Bluetooth in bunches,
-   * so each one is held until [PLAYOUT_DELAY_MS] after its capture-time slot, then shown. That
+   * so each one is held until [delayMs] after its capture-time slot, then shown. That
    * turns bursts back into even motion. A frame that still arrives late is shown at once and the
    * schedule slides back to match it; if frames start arriving far ahead of schedule (delay has
    * crept up, or timestamps jumped) the schedule is reset to the target delay.
    */
-  private suspend fun playOut(buffer: Channel<TimedFrame>) {
+  private suspend fun playOut(buffer: Channel<TimedFrame>, delayMs: Long) {
     var baseMs = 0L // on-screen time for pts 0
     var anchored = false
     for (timed in buffer) {
       val now = SystemClock.elapsedRealtime()
       val late = now - (baseMs + timed.ptsMs)
       when {
-        !anchored || -late > 2 * PLAYOUT_DELAY_MS -> {
-          baseMs = now + PLAYOUT_DELAY_MS - timed.ptsMs
+        !anchored || -late > 2 * delayMs -> {
+          baseMs = now + delayMs - timed.ptsMs
           anchored = true
         }
         late > 0 -> baseMs += late
@@ -250,22 +321,31 @@ class LiveViewModel : ViewModel() {
 
   private fun fail(message: String) {
     Log.e(TAG, message)
-    teardown()
+    endSession()
     _ui.update { it.copy(message = message) }
   }
 
-  private fun teardown() {
-    jobs.forEach { it.cancel() }
-    jobs.clear()
+  private fun closeCamera() {
+    wantCamera = false
+    cameraJobs.forEach { it.cancel() }
+    cameraJobs.clear()
+    // Stopping the camera also detaches it, so the next open can add one with new settings.
     camera?.stop()
     camera = null
-    session?.stop()
-    session = null
     _frames.value = null
     _ui.update { it.copy(streaming = null) }
   }
 
+  private fun endSession() {
+    closeCamera()
+    sessionJobs.forEach { it.cancel() }
+    sessionJobs.clear()
+    session?.stop()
+    session = null
+    sessionStarted = false
+  }
+
   override fun onCleared() {
-    teardown()
+    endSession()
   }
 }

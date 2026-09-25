@@ -55,7 +55,7 @@ class MainActivity : ComponentActivity() {
           viewModel = viewModel,
           onGrantBluetooth = ::ensureBluetoothPermission,
           onConnect = { Wearables.startRegistration(this) },
-          onGoLive = { viewModel.goLive(::requestCameraPermission) },
+          onOpenCamera = { viewModel.goLive(::requestCameraPermission) },
           onUpdateGlasses = {
             Wearables.openDATGlassesAppUpdate(this).onFailure { error, _ ->
               viewModel.showMessage("Couldn't open Meta AI ($error). Update from its settings.")
@@ -68,6 +68,11 @@ class MainActivity : ComponentActivity() {
   override fun onStart() {
     super.onStart()
     ensureBluetoothPermission()
+  }
+
+  override fun onStop() {
+    super.onStop()
+    viewModel.onBackground()
   }
 
   private fun ensureBluetoothPermission() {
