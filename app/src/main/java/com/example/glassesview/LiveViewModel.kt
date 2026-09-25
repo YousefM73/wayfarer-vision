@@ -88,6 +88,9 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
 
   companion object {
     private const val TAG = "GlassesView"
+
+    // How far back the jitter buffer looks for its fastest-delivery baseline.
+    private const val BASELINE_WINDOW_MS = 3_000L
   }
 
   private val _ui = MutableStateFlow(LiveUiState())
@@ -258,7 +261,13 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
                   val src = frame.buffer.duplicate()
                   val bytes = ByteArray(src.remaining()).also { src.get(it) }
                   buffer.trySend(
-                      TimedFrame(bytes, frame.width, frame.height, frame.presentationTimeUs / 1000))
+                      TimedFrame(
+                          bytes,
+                          frame.width,
+                          frame.height,
+                          frame.presentationTimeUs / 1000,
+                          SystemClock.elapsedRealtime(),
+                      ))
                 }
               }
               val bufferMs = opened.bufferMs
@@ -290,29 +299,30 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
         )
   }
 
-  private class TimedFrame(val yuv: ByteArray, val width: Int, val height: Int, val ptsMs: Long)
+  private class TimedFrame(
+      val yuv: ByteArray,
+      val width: Int,
+      val height: Int,
+      val ptsMs: Long, // capture time on the glasses' clock
+      val arrivedMs: Long, // arrival time on the phone's clock
+  )
 
   /**
-   * Jitter buffer. Frames leave the glasses at a steady rate but arrive over Bluetooth in bunches,
-   * so each one is held until [delayMs] after its capture-time slot, then shown. That
-   * turns bursts back into even motion. A frame that still arrives late is shown at once and the
-   * schedule slides back to match it; if frames start arriving far ahead of schedule (delay has
-   * crept up, or timestamps jumped) the schedule is reset to the target delay.
+   * Jitter buffer. Frames leave the glasses at a steady rate but arrive over Bluetooth in bunches.
+   * Each frame's transport delay is `arrived - pts` (plus an unknown clock offset); the fastest
+   * delivery over the last few seconds is the baseline. A frame is shown [delayMs] after the time
+   * it would have arrived at that baseline, so bunched frames play back at their capture pace, and
+   * frames later than that are shown at once. Because the baseline is a recent minimum, a stall
+   * never pushes the delay up for good: once delivery recovers, delay drops back to [delayMs].
    */
   private suspend fun playOut(buffer: Channel<TimedFrame>, delayMs: Long) {
-    var baseMs = 0L // on-screen time for pts 0
-    var anchored = false
+    val recent = ArrayDeque<TimedFrame>() // frames from the last BASELINE_WINDOW_MS, by arrival
     for (timed in buffer) {
+      recent.addLast(timed)
+      while (recent.first().arrivedMs < timed.arrivedMs - BASELINE_WINDOW_MS) recent.removeFirst()
+      val baseline = recent.minOf { it.arrivedMs - it.ptsMs }
+      val dueMs = timed.ptsMs + baseline + delayMs
       val now = SystemClock.elapsedRealtime()
-      val late = now - (baseMs + timed.ptsMs)
-      when {
-        !anchored || -late > 2 * delayMs -> {
-          baseMs = now + delayMs - timed.ptsMs
-          anchored = true
-        }
-        late > 0 -> baseMs += late
-      }
-      val dueMs = baseMs + timed.ptsMs
       if (dueMs > now) delay(dueMs - now)
       val bitmap = converter.convert(timed.yuv, timed.width, timed.height) ?: continue
       _frames.value = bitmap

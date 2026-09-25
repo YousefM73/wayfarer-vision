@@ -25,8 +25,9 @@ from Meta AI → Settings → App Info while wearing the glasses (Developer Mode
 ## How the video gets on screen
 
 1. The SDK streams frames over Bluetooth and decodes them on the phone (I420).
-2. Frames arrive in bunches, so a small jitter buffer holds each one until `PLAYOUT_DELAY_MS`
-   after its capture time, then releases it. Bursts come out as even motion.
+2. Frames arrive in bunches, so a small jitter buffer holds each one until the chosen buffer time
+   after it would have arrived on the fastest recent delivery, then releases it. Bursts come out
+   as even motion, and after a Bluetooth stall the delay drops back instead of staying high.
 3. At its playback time a frame is converted to a bitmap and drawn onto a `SurfaceView` with a
    hardware canvas, off the main thread.
 
@@ -37,7 +38,8 @@ Chosen on the camera screen and remembered between launches; they apply when the
 - **Quality**: 360p, 504p (default) or 720p (360×640, 504×896, 720×1280).
 - **Frame rate**: 15, 24 (default) or 30 fps.
 - **Buffer**: 100, 200 (default) or 300 ms. Smaller is closer to real time; larger rides out
-  longer Bluetooth stalls.
+  longer Bluetooth stalls. Total glasses-to-screen delay is the buffer plus ~300 ms for the
+  glasses, Bluetooth and decoding (measured ~0.6 s at 300 ms on a Galaxy Note 9).
 
 The stream is always portrait; the SDK has no landscape option.
 
