@@ -19,17 +19,17 @@ android {
 
   defaultConfig {
     applicationId = "com.example.glassesview"
-    minSdk = 31
+    minSdk = 29
     targetSdk = 36
     versionCode = 1
     versionName = "1.0"
 
-    // "0" works while Developer Mode is enabled in the Meta AI app. For release builds, put the
+    // Empty works while Developer Mode is enabled in the Meta AI app. For release builds, put the
     // credentials from the Wearables Developer Center in local.properties.
     manifestPlaceholders["mwdat_application_id"] =
-        localProperties.getProperty("mwdat_application_id", "0")
+        localProperties.getProperty("mwdat_application_id", "")
     manifestPlaceholders["mwdat_client_token"] =
-        localProperties.getProperty("mwdat_client_token", "0")
+        localProperties.getProperty("mwdat_client_token", "")
   }
 
   buildTypes {

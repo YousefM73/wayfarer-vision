@@ -1,7 +1,6 @@
 package com.example.glassesview
 
 import android.graphics.Bitmap
-import java.nio.ByteBuffer
 
 /**
  * Converts the SDK's decoded I420 frames (Y plane, then U, then V at quarter size) to ARGB
@@ -10,22 +9,16 @@ import java.nio.ByteBuffer
  */
 class I420Converter {
 
-  private var yuv = ByteArray(0)
   private var pixels = IntArray(0)
   private val pool = arrayOfNulls<Bitmap>(3)
   private var next = 0
 
-  fun convert(buffer: ByteBuffer, width: Int, height: Int): Bitmap? {
+  fun convert(yuv: ByteArray, width: Int, height: Int): Bitmap? {
     if (width <= 0 || height <= 0 || width % 2 != 0 || height % 2 != 0) return null
     val lumaSize = width * height
     val chromaSize = lumaSize / 4
-    val needed = lumaSize + 2 * chromaSize
-
-    val src = buffer.duplicate()
-    if (src.remaining() < needed) return null
-    if (yuv.size != needed) yuv = ByteArray(needed)
+    if (yuv.size < lumaSize + 2 * chromaSize) return null
     if (pixels.size != lumaSize) pixels = IntArray(lumaSize)
-    src.get(yuv, 0, needed)
 
     val uStart = lumaSize
     val vStart = lumaSize + chromaSize

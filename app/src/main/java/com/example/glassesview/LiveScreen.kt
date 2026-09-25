@@ -1,6 +1,10 @@
 package com.example.glassesview
 
-import androidx.compose.foundation.Image
+import android.graphics.Bitmap
+import android.graphics.Paint
+import android.graphics.Rect
+import android.view.Surface
+import androidx.compose.foundation.AndroidExternalSurface
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -9,6 +13,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -30,13 +35,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 private val Dim = Color.White.copy(alpha = 0.6f)
@@ -48,24 +53,40 @@ fun LiveScreen(
     onGrantBluetooth: () -> Unit,
     onConnect: () -> Unit,
     onGoLive: () -> Unit,
+    onUpdateGlasses: () -> Unit,
 ) {
   val ui by viewModel.ui.collectAsStateWithLifecycle()
 
   MaterialTheme(colorScheme = darkColorScheme()) {
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-      ui.frame?.let { frame ->
-        Image(
-            bitmap = frame.asImageBitmap(),
-            contentDescription = "Live view from glasses",
-            contentScale = ContentScale.Fit,
-            modifier = Modifier.fillMaxSize(),
-        )
+      // Frames are drawn onto this surface with a hardware canvas, off the main thread, so the UI
+      // never redraws per frame. The glasses' feed is always 9:16 portrait.
+      if (ui.streaming != null) {
+        AndroidExternalSurface(modifier = Modifier.align(Alignment.Center).aspectRatio(9f / 16f)) {
+          onSurface { surface, initialWidth, initialHeight ->
+            val dst = Rect(0, 0, initialWidth, initialHeight)
+            surface.onChanged { width, height -> dst.set(0, 0, width, height) }
+            withContext(Dispatchers.Default) {
+              viewModel.frames.collect { frame ->
+                if (frame != null) drawFrame(surface, frame, dst)
+              }
+            }
+          }
+        }
       }
 
       when (val phase = ui.phase) {
         Phase.Live,
         Phase.Paused -> LiveOverlay(paused = phase == Phase.Paused, onStop = viewModel::stop)
-        else -> SetupContent(phase, ui.bluetoothDenied, onGrantBluetooth, onConnect, onGoLive)
+        else ->
+            SetupContent(
+                phase,
+                ui.bluetoothDenied,
+                onGrantBluetooth,
+                onConnect,
+                onGoLive,
+                onUpdateGlasses,
+            )
       }
 
       ui.message?.let {
@@ -84,6 +105,22 @@ fun LiveScreen(
   }
 }
 
+private val framePaint = Paint(Paint.FILTER_BITMAP_FLAG)
+
+private fun drawFrame(surface: Surface, frame: Bitmap, dst: Rect) {
+  val canvas =
+      try {
+        surface.lockHardwareCanvas()
+      } catch (_: RuntimeException) {
+        return // surface is going away
+      }
+  try {
+    canvas.drawBitmap(frame, null, dst, framePaint)
+  } finally {
+    surface.unlockCanvasAndPost(canvas)
+  }
+}
+
 @Composable
 private fun SetupContent(
     phase: Phase,
@@ -91,6 +128,7 @@ private fun SetupContent(
     onGrantBluetooth: () -> Unit,
     onConnect: () -> Unit,
     onGoLive: () -> Unit,
+    onUpdateGlasses: () -> Unit,
 ) {
   Column(
       modifier = Modifier.fillMaxSize().systemBarsPadding().padding(32.dp),
@@ -110,6 +148,17 @@ private fun SetupContent(
         PillButton("Connect", onConnect)
       }
       Phase.Registering -> Waiting("Finish linking in Meta AI…")
+      Phase.GlassesUpdateRequired -> {
+        Hint("Your glasses need Meta's toolkit installed or updated before they can stream.")
+        PillButton("Update glasses", onUpdateGlasses)
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "Try again",
+            color = Dim,
+            fontSize = 14.sp,
+            modifier = Modifier.clickable(onClick = onGoLive).padding(12.dp),
+        )
+      }
       Phase.WaitingForGlasses -> Waiting("Waiting for glasses…\nTurn them on and keep them nearby.")
       Phase.Connecting -> Waiting("Connecting…")
       Phase.Ready -> {

@@ -2,8 +2,11 @@ package com.example.glassesview
 
 import android.Manifest.permission.BLUETOOTH_CONNECT
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
@@ -43,13 +46,21 @@ class MainActivity : ComponentActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
-    enableEdgeToEdge()
+    enableEdgeToEdge(
+        statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+        navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+    )
     setContent {
       LiveScreen(
           viewModel = viewModel,
           onGrantBluetooth = ::ensureBluetoothPermission,
           onConnect = { Wearables.startRegistration(this) },
           onGoLive = { viewModel.goLive(::requestCameraPermission) },
+          onUpdateGlasses = {
+            Wearables.openDATGlassesAppUpdate(this).onFailure { error, _ ->
+              viewModel.showMessage("Couldn't open Meta AI ($error). Update from its settings.")
+            }
+          },
       )
     }
   }
@@ -60,8 +71,11 @@ class MainActivity : ComponentActivity() {
   }
 
   private fun ensureBluetoothPermission() {
-    if (ContextCompat.checkSelfPermission(this, BLUETOOTH_CONNECT) ==
-        PackageManager.PERMISSION_GRANTED) {
+    // BLUETOOTH_CONNECT is a runtime permission only on Android 12+; earlier versions grant
+    // Bluetooth access at install time.
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+        ContextCompat.checkSelfPermission(this, BLUETOOTH_CONNECT) ==
+            PackageManager.PERMISSION_GRANTED) {
       viewModel.initialize(applicationContext)
     } else {
       bluetoothPermission.launch(BLUETOOTH_CONNECT)
