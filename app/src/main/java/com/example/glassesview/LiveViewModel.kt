@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.meta.wearable.dat.camera.Camera
 import com.meta.wearable.dat.camera.addCamera
 import com.meta.wearable.dat.camera.types.StreamConfiguration
+import com.meta.wearable.dat.camera.types.StreamError
 import com.meta.wearable.dat.camera.types.StreamState
 import com.meta.wearable.dat.camera.types.VideoQuality
 import com.meta.wearable.dat.core.Wearables
@@ -20,6 +21,7 @@ import com.meta.wearable.dat.core.types.DeviceSessionError
 import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
 import com.meta.wearable.dat.core.types.RegistrationState
+import com.meta.wearable.dat.core.types.WearablesError
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
@@ -129,21 +131,28 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
 
   fun initialize(context: Context) {
     if (_ui.value.sdkReady) return
+    // The SDK is set up once per process. A fresh ViewModel (a new activity instance, e.g. after
+    // coming back from Meta AI) finds it already initialized, which is fine.
+    var ready = false
     Wearables.initialize(context)
-        .onSuccess {
-          _ui.update { it.copy(sdkReady = true, bluetoothDenied = false) }
-          viewModelScope.launch {
-            Wearables.registrationState.collect { state ->
-              _ui.update { it.copy(registration = state) }
-            }
-          }
-          viewModelScope.launch {
-            Wearables.devices.collect { devices ->
-              _ui.update { it.copy(hasGlasses = devices.isNotEmpty()) }
-            }
+        .onSuccess { ready = true }
+        .onFailure { error, _ ->
+          if (error == WearablesError.ALREADY_INITIALIZED) {
+            ready = true
+          } else {
+            _ui.update { it.copy(message = error.description) }
           }
         }
-        .onFailure { error, _ -> _ui.update { it.copy(message = error.description) } }
+    if (!ready) return
+    _ui.update { it.copy(sdkReady = true, bluetoothDenied = false) }
+    viewModelScope.launch {
+      Wearables.registrationState.collect { state -> _ui.update { it.copy(registration = state) } }
+    }
+    viewModelScope.launch {
+      Wearables.devices.collect { devices ->
+        _ui.update { it.copy(hasGlasses = devices.isNotEmpty()) }
+      }
+    }
   }
 
   fun updateSettings(change: (StreamSettings) -> StreamSettings) {
@@ -223,7 +232,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
                     endSession()
                     _ui.update { it.copy(glassesUpdateRequired = true, message = null) }
                   } else {
-                    fail(error.description)
+                    fail(explain(error))
                   }
                 }
               }
@@ -273,6 +282,8 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
               val bufferMs = opened.bufferMs
               cameraJobs += viewModelScope.launch(Dispatchers.Default) { playOut(buffer, bufferMs) }
               cameraJobs += viewModelScope.launch {
+                // The state replays STOPPED on subscribe; only a STOPPED/CLOSED after the
+                // stream has been starting or running means it ended.
                 var active = false
                 stream.state.collect { state ->
                   when (state) {
@@ -283,14 +294,25 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
                     StreamState.PAUSED -> _ui.update { it.copy(streaming = Phase.Paused) }
                     StreamState.STOPPED,
                     StreamState.CLOSED -> if (active) closeCamera()
-                    else -> Unit
+                    else -> active = true // STARTING, STARTED, STOPPING
                   }
                 }
               }
               cameraJobs += viewModelScope.launch {
                 stream.errorStream.collect { error ->
                   Log.w(TAG, "Stream error: ${error.description}")
-                  _ui.update { it.copy(message = error.description) }
+                  if (error == StreamError.CRITICAL_STREAM_ERROR) {
+                    // Per the SDK docs the stream is done; usually the glasses never started it.
+                    _ui.update {
+                      it.copy(
+                          message =
+                              "The glasses didn't start streaming. Check they're on, nearby and " +
+                                  "not connected to another phone.")
+                    }
+                    closeCamera()
+                  } else {
+                    _ui.update { it.copy(message = error.description) }
+                  }
                 }
               }
               stream.start().onFailure { error, _ -> fail(error.description) }
@@ -328,6 +350,20 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
       _frames.value = bitmap
     }
   }
+
+  /** Plain-language versions of the session errors a user can do something about. */
+  private fun explain(error: DeviceSessionError): String =
+      when (error) {
+        DeviceSessionError.THERMAL_CRITICAL,
+        DeviceSessionError.THERMAL_EMERGENCY ->
+            "Your glasses are too warm to stream. Give them a few minutes to cool down; a lower " +
+                "quality and frame rate run cooler."
+        DeviceSessionError.BATTERY_CRITICAL,
+        DeviceSessionError.PEAK_POWER_SHUTDOWN -> "Your glasses' battery is too low to stream."
+        DeviceSessionError.DEVICE_DISCONNECTED ->
+            "Lost the connection to your glasses. Check they're on and nearby."
+        else -> error.description
+      }
 
   private fun fail(message: String) {
     Log.e(TAG, message)

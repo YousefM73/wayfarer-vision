@@ -10,6 +10,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -18,13 +19,16 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -42,6 +46,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -74,7 +79,7 @@ fun LiveScreen(
       // bars. Frames are drawn onto the surface with a hardware canvas, off the main thread, so
       // the UI never redraws per frame; the viewfinder overlay sits on the same frame.
       if (ui.streaming != null) {
-        Box(Modifier.fillMaxSize().systemBarsPadding(), contentAlignment = Alignment.Center) {
+        Box(Modifier.fillMaxSize().safeDrawingPadding(), contentAlignment = Alignment.Center) {
           Box(Modifier.aspectRatio(9f / 16f)) {
             AndroidExternalSurface(modifier = Modifier.fillMaxSize()) {
               onSurface { surface, initialWidth, initialHeight ->
@@ -122,7 +127,7 @@ fun LiveScreen(
             textAlign = TextAlign.Center,
             modifier =
                 Modifier.align(Alignment.TopCenter)
-                    .systemBarsPadding()
+                    .safeDrawingPadding()
                     .padding(start = 24.dp, end = 24.dp, top = 64.dp),
         )
       }
@@ -156,7 +161,7 @@ private fun SetupContent(
     onUpdateGlasses: () -> Unit,
 ) {
   Column(
-      modifier = Modifier.fillMaxSize().systemBarsPadding().padding(32.dp),
+      modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(32.dp),
       horizontalAlignment = Alignment.CenterHorizontally,
       verticalArrangement = Arrangement.Center,
   ) {
@@ -193,18 +198,37 @@ private fun SetupContent(
   }
 }
 
-/** The idle camera: a shutter-style button to open it, with stream settings below. */
+/** The idle camera: a shutter-style button to open it, with stream settings below or beside. */
 @Composable
 private fun CameraStart(
     settings: StreamSettings,
     onChange: ((StreamSettings) -> StreamSettings) -> Unit,
     onOpen: () -> Unit,
 ) {
-  Column(
-      modifier = Modifier.fillMaxSize().systemBarsPadding().padding(horizontal = 28.dp, vertical = 24.dp),
-      horizontalAlignment = Alignment.CenterHorizontally,
-  ) {
-    Spacer(Modifier.weight(1f))
+  BoxWithConstraints(Modifier.fillMaxSize().safeDrawingPadding()) {
+    val content = Modifier.fillMaxSize().padding(horizontal = 28.dp, vertical = 24.dp)
+    if (maxWidth > maxHeight) {
+      // Wide screen (a fold held sideways, or a tablet): shutter left, settings right.
+      Row(content, verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { Shutter(onOpen) }
+        Box(Modifier.weight(1.4f), contentAlignment = Alignment.Center) {
+          SettingsPanel(settings, onChange)
+        }
+      }
+    } else {
+      Column(content, horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.weight(1f))
+        Shutter(onOpen)
+        Spacer(Modifier.weight(1f))
+        SettingsPanel(settings, onChange)
+      }
+    }
+  }
+}
+
+@Composable
+private fun Shutter(onOpen: () -> Unit) {
+  Column(horizontalAlignment = Alignment.CenterHorizontally) {
     Box(
         contentAlignment = Alignment.Center,
         modifier =
@@ -217,15 +241,26 @@ private fun CameraStart(
     }
     Spacer(Modifier.height(14.dp))
     Text("Open camera", color = Dim, fontSize = 14.sp)
-    Spacer(Modifier.weight(1f))
+  }
+}
 
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+@Composable
+private fun SettingsPanel(
+    settings: StreamSettings,
+    onChange: ((StreamSettings) -> StreamSettings) -> Unit,
+) {
+  // Capped so the rows don't stretch across a wide unfolded screen.
+  BoxWithConstraints(Modifier.widthIn(max = 480.dp)) {
+    // On a narrow screen (a fold's cover screen) the label sits above its chips, not beside them.
+    val stacked = maxWidth < 330.dp
+    Column(verticalArrangement = Arrangement.spacedBy(if (stacked) 14.dp else 12.dp)) {
       SettingRow(
           title = "Quality",
           options = StreamSettings.QUALITIES.keys.toList(),
           selected = settings.quality,
           label = { "${StreamSettings.QUALITIES.getValue(it).first}p" },
           onSelect = { q -> onChange { it.copy(quality = q) } },
+          stacked = stacked,
       )
       SettingRow(
           title = "Frame rate",
@@ -233,6 +268,7 @@ private fun CameraStart(
           selected = settings.fps,
           label = { "$it fps" },
           onSelect = { fps -> onChange { it.copy(fps = fps) } },
+          stacked = stacked,
       )
       SettingRow(
           title = "Buffer",
@@ -240,6 +276,7 @@ private fun CameraStart(
           selected = settings.bufferMs,
           label = { "$it ms" },
           onSelect = { ms -> onChange { it.copy(bufferMs = ms) } },
+          stacked = stacked,
       )
       Text(
           "A smaller buffer is closer to real time; a larger one rides out Bluetooth hiccups.",
@@ -258,35 +295,64 @@ private fun <T> SettingRow(
     selected: T,
     label: (T) -> String,
     onSelect: (T) -> Unit,
+    stacked: Boolean,
 ) {
-  Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-    Text(title, color = Dim, fontSize = 13.sp, modifier = Modifier.width(84.dp))
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        modifier = Modifier.weight(1f).selectableGroup(),
-    ) {
-      for (option in options) {
-        val isSelected = option == selected
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier =
-                Modifier.weight(1f)
-                    .clip(RoundedCornerShape(50))
-                    .background(if (isSelected) Color.White else Color.White.copy(alpha = 0.08f))
-                    .selectable(
-                        selected = isSelected,
-                        role = Role.RadioButton,
-                        onClick = { onSelect(option) },
-                    )
-                    .padding(vertical = 8.dp),
-        ) {
-          Text(
-              label(option),
-              color = if (isSelected) Color.Black else Color.White,
-              fontSize = 13.sp,
-              fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
-          )
-        }
+  if (stacked) {
+    Column(Modifier.fillMaxWidth()) {
+      Text(title, color = Dim, fontSize = 13.sp, modifier = Modifier.padding(bottom = 6.dp))
+      Chips(options, selected, label, onSelect, Modifier.fillMaxWidth())
+    }
+  } else {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+      BasicText(
+          title,
+          style = TextStyle(color = Dim, fontSize = 13.sp),
+          maxLines = 1,
+          autoSize = TextAutoSize.StepBased(minFontSize = 10.sp, maxFontSize = 13.sp),
+          modifier = Modifier.width(84.dp),
+      )
+      Chips(options, selected, label, onSelect, Modifier.weight(1f))
+    }
+  }
+}
+
+@Composable
+private fun <T> Chips(
+    options: List<T>,
+    selected: T,
+    label: (T) -> String,
+    onSelect: (T) -> Unit,
+    modifier: Modifier,
+) {
+  Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = modifier.selectableGroup()) {
+    for (option in options) {
+      val isSelected = option == selected
+      Box(
+          contentAlignment = Alignment.Center,
+          modifier =
+              Modifier.weight(1f)
+                  .clip(RoundedCornerShape(50))
+                  .background(if (isSelected) Color.White else Color.White.copy(alpha = 0.08f))
+                  .selectable(
+                      selected = isSelected,
+                      role = Role.RadioButton,
+                      onClick = { onSelect(option) },
+                  )
+                  .padding(horizontal = 6.dp, vertical = 8.dp),
+      ) {
+        // Shrinks rather than wraps when the chip is narrow or the font size is large.
+        BasicText(
+            label(option),
+            style =
+                TextStyle(
+                    color = if (isSelected) Color.Black else Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
+                    textAlign = TextAlign.Center,
+                ),
+            maxLines = 1,
+            autoSize = TextAutoSize.StepBased(minFontSize = 9.sp, maxFontSize = 13.sp),
+        )
       }
     }
   }
@@ -319,39 +385,20 @@ private fun Viewfinder(settings: StreamSettings, paused: Boolean, onClose: () ->
         })
 
     Box(Modifier.fillMaxSize().padding(horizontal = 26.dp, vertical = 28.dp)) {
-      Row(
-          verticalAlignment = Alignment.CenterVertically,
-          modifier = Modifier.align(Alignment.TopStart).fillMaxWidth(),
-      ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier =
-                Modifier.clip(RoundedCornerShape(50))
-                    .background(Scrim)
-                    .padding(horizontal = 10.dp, vertical = 5.dp),
-        ) {
-          Box(Modifier.size(7.dp).clip(CircleShape).background(if (paused) Held else Streaming))
-          Spacer(Modifier.width(6.dp))
-          Text(
-              if (paused) "PAUSED" else "CAMERA",
-              color = Color.White,
-              fontSize = 11.sp,
-              fontWeight = FontWeight.Medium,
-              letterSpacing = 1.2.sp,
-          )
+      BoxWithConstraints(Modifier.align(Alignment.TopStart).fillMaxWidth()) {
+        if (maxWidth < 340.dp) {
+          // Narrow frame (a fold's cover screen, or unfolded and held sideways): stack the pills.
+          Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            StatusPill(paused)
+            SpecPill(settings)
+          }
+        } else {
+          Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            StatusPill(paused)
+            Spacer(Modifier.weight(1f))
+            SpecPill(settings)
+          }
         }
-        Spacer(Modifier.weight(1f))
-        val (w, h) = StreamSettings.QUALITIES.getValue(settings.quality)
-        Text(
-            "$w×$h · ${settings.fps} fps · ${settings.bufferMs} ms",
-            color = Dim,
-            fontSize = 11.sp,
-            fontFamily = FontFamily.Monospace,
-            modifier =
-                Modifier.clip(RoundedCornerShape(50))
-                    .background(Scrim)
-                    .padding(horizontal = 10.dp, vertical = 5.dp),
-        )
       }
 
       // Close: white ring with a white square.
@@ -369,6 +416,42 @@ private fun Viewfinder(settings: StreamSettings, paused: Boolean, onClose: () ->
       }
     }
   }
+}
+
+@Composable
+private fun StatusPill(paused: Boolean) {
+  Row(
+      verticalAlignment = Alignment.CenterVertically,
+      modifier =
+          Modifier.clip(RoundedCornerShape(50))
+              .background(Scrim)
+              .padding(horizontal = 10.dp, vertical = 5.dp),
+  ) {
+    Box(Modifier.size(7.dp).clip(CircleShape).background(if (paused) Held else Streaming))
+    Spacer(Modifier.width(6.dp))
+    Text(
+        if (paused) "PAUSED" else "CAMERA",
+        color = Color.White,
+        fontSize = 11.sp,
+        fontWeight = FontWeight.Medium,
+        letterSpacing = 1.2.sp,
+    )
+  }
+}
+
+@Composable
+private fun SpecPill(settings: StreamSettings) {
+  val (w, h) = StreamSettings.QUALITIES.getValue(settings.quality)
+  BasicText(
+      "$w×$h · ${settings.fps} fps · ${settings.bufferMs} ms",
+      style = TextStyle(color = Dim, fontSize = 11.sp, fontFamily = FontFamily.Monospace),
+      maxLines = 1,
+      autoSize = TextAutoSize.StepBased(minFontSize = 9.sp, maxFontSize = 11.sp),
+      modifier =
+          Modifier.clip(RoundedCornerShape(50))
+              .background(Scrim)
+              .padding(horizontal = 10.dp, vertical = 5.dp),
+  )
 }
 
 @Composable

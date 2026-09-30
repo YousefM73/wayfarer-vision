@@ -41,7 +41,10 @@ Chosen on the camera screen and remembered between launches; they apply when the
   longer Bluetooth stalls. Total glasses-to-screen delay is the buffer plus ~300 ms for the
   glasses, Bluetooth and decoding (measured ~0.6 s at 300 ms on a Galaxy Note 9).
 
-The stream is always portrait; the SDK has no landscape option.
+The stream is always portrait; the SDK has no landscape option. The app itself isn't locked
+to portrait: on a foldable or tablet the video is centred at 9:16 in any orientation, the settings
+sit beside the shutter button on wide screens, and folding, unfolding or rotating mid-stream
+keeps the camera open. Tested on a Galaxy Z Fold3 (Android 15).
 
 ## Smoother video: turn off background Bluetooth scanning
 

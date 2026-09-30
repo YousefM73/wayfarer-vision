@@ -72,7 +72,8 @@ class MainActivity : ComponentActivity() {
 
   override fun onStop() {
     super.onStop()
-    viewModel.onBackground()
+    // Folding, unfolding or rotating can recreate the activity; that isn't leaving the app.
+    if (!isChangingConfigurations) viewModel.onBackground()
   }
 
   private fun ensureBluetoothPermission() {
