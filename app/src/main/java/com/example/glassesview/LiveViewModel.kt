@@ -41,6 +41,7 @@ enum class Phase {
   WaitingForGlasses,
   Ready,
   Connecting,
+  Listening, // serving to a computer; the glasses stream once a player connects
   Live,
   Paused,
 }
@@ -50,6 +51,7 @@ data class StreamSettings(
     val quality: VideoQuality = VideoQuality.MEDIUM,
     val fps: Int = 24,
     val bufferMs: Long = 200,
+    val toComputer: Boolean = false, // serve the compressed stream over TCP instead of showing it
 ) {
   companion object {
     // Portrait frame sizes the SDK streams at each quality.
@@ -70,7 +72,10 @@ data class LiveUiState(
     val registration: RegistrationState? = null,
     val hasGlasses: Boolean = false,
     val glassesUpdateRequired: Boolean = false,
-    val streaming: Phase? = null, // Connecting, Live or Paused while a session is open
+    val streaming: Phase? = null, // Connecting, Listening, Live or Paused while a session is open
+    val toComputer: Boolean = false, // what the open camera is doing
+    val serverAddress: String? = null, // host:port on the local network, in computer mode
+    val clientAddress: String? = null, // the connected player, in computer mode
     val message: String? = null,
 ) {
   val phase: Phase
@@ -93,6 +98,9 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
 
     // How far back the jitter buffer looks for its fastest-delivery baseline.
     private const val BASELINE_WINDOW_MS = 3_000L
+
+    // TCP port the compressed stream is served on in computer mode.
+    const val PORT = 5000
   }
 
   private val _ui = MutableStateFlow(LiveUiState())
@@ -107,6 +115,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
                       ?: VideoQuality.MEDIUM,
               fps = prefs.getInt("fps", 24),
               bufferMs = prefs.getLong("bufferMs", 200),
+              toComputer = prefs.getBoolean("toComputer", false),
           ))
   val settings: StateFlow<StreamSettings> = _settings.asStateFlow()
 
@@ -128,6 +137,8 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   private var camera: Camera? = null
   private var wantCamera = false
   private val cameraJobs = mutableListOf<Job>()
+  private var server: StreamServer? = null
+  private var serverJob: Job? = null
 
   fun initialize(context: Context) {
     if (_ui.value.sdkReady) return
@@ -163,6 +174,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
         .putString("quality", next.quality.name)
         .putInt("fps", next.fps)
         .putLong("bufferMs", next.bufferMs)
+        .putBoolean("toComputer", next.toComputer)
         .apply()
   }
 
@@ -177,8 +189,14 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   fun goLive(requestCameraPermission: suspend () -> PermissionStatus) {
     if (_ui.value.streaming != null) return
     wantCamera = true
+    opened = _settings.value
     _ui.update {
-      it.copy(streaming = Phase.Connecting, glassesUpdateRequired = false, message = null)
+      it.copy(
+          streaming = Phase.Connecting,
+          toComputer = opened.toComputer,
+          glassesUpdateRequired = false,
+          message = null,
+      )
     }
     viewModelScope.launch {
       var status: PermissionStatus? = null
@@ -198,14 +216,17 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
     }
   }
 
-  /** Closes the camera but keeps the session with the glasses, so it can reopen straight away. */
+  /** Closes the camera (and server) but keeps the session with the glasses for a quick reopen. */
   fun stop() {
+    wantCamera = false
     closeCamera()
+    stopServer()
+    _ui.update { it.copy(streaming = null, serverAddress = null, clientAddress = null) }
   }
 
   /** The app left the screen: don't keep streaming in the background. */
   fun onBackground() {
-    if (camera != null) closeCamera()
+    if (_ui.value.streaming != null) stop()
   }
 
   private fun startCamera() {
@@ -213,9 +234,46 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
     val current = session
     when {
       current == null -> openSession()
-      sessionStarted && camera == null -> attachCamera(current)
-      else -> Unit // still starting; the session's state collector attaches the camera
+      sessionStarted && camera == null -> onSessionReady(current)
+      else -> Unit // still starting; the session's state collector continues from STARTED
     }
+  }
+
+  /** The session is up: stream to this phone now, or wait for a computer to connect. */
+  private fun onSessionReady(session: DeviceSession) {
+    if (opened.toComputer) startServer(session) else attachCamera(session)
+  }
+
+  private fun startServer(session: DeviceSession) {
+    if (server != null) return
+    val started = StreamServer(PORT, viewModelScope).also { server = it }
+    started.start()
+    _ui.update {
+      it.copy(
+          streaming = Phase.Listening,
+          serverAddress = StreamServer.localAddress()?.let { ip -> "$ip:$PORT" },
+      )
+    }
+    // The glasses stream only while a player is connected: each connection gets a fresh stream
+    // (parameter sets and a keyframe first), and the glasses stay cool while nobody is watching.
+    serverJob =
+        viewModelScope.launch {
+          started.client.collect { client ->
+            _ui.update { it.copy(clientAddress = client) }
+            if (client != null) {
+              if (camera == null) attachCamera(session)
+            } else if (camera != null) {
+              cameraEnded()
+            }
+          }
+        }
+  }
+
+  private fun stopServer() {
+    serverJob?.cancel()
+    serverJob = null
+    server?.stop()
+    server = null
   }
 
   private fun openSession() {
@@ -241,7 +299,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
                   when (state) {
                     DeviceSessionState.STARTED -> {
                       sessionStarted = true
-                      if (wantCamera && camera == null) attachCamera(created)
+                      if (wantCamera && camera == null) onSessionReady(created)
                     }
                     DeviceSessionState.STOPPED -> if (sessionStarted) endSession()
                     else -> Unit
@@ -255,9 +313,14 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   }
 
   private fun attachCamera(session: DeviceSession) {
-    opened = _settings.value
     session
-        .addCamera(StreamConfiguration(videoQuality = opened.quality, frameRate = opened.fps))
+        .addCamera(
+            StreamConfiguration(
+                videoQuality = opened.quality,
+                frameRate = opened.fps,
+                // Decoded on the phone to show here; compressed HEVC to pass on to a computer.
+                compressVideo = opened.toComputer,
+            ))
         .fold(
             onSuccess = { added ->
               camera = added
@@ -265,7 +328,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
               val buffer = Channel<TimedFrame>(64, BufferOverflow.DROP_OLDEST)
               cameraJobs += viewModelScope.launch(Dispatchers.Default) {
                 stream.videoStream.collect { frame ->
-                  if (frame.isCompressed) return@collect
+                  if (frame.isCompressed != opened.toComputer) return@collect
                   // Copy out of the SDK's buffer, which it may reuse after this returns.
                   val src = frame.buffer.duplicate()
                   val bytes = ByteArray(src.remaining()).also { src.get(it) }
@@ -280,7 +343,18 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
                 }
               }
               val bufferMs = opened.bufferMs
-              cameraJobs += viewModelScope.launch(Dispatchers.Default) { playOut(buffer, bufferMs) }
+              val show: (TimedFrame) -> Unit =
+                  if (opened.toComputer) {
+                    { frame -> server?.send(frame.data) }
+                  } else {
+                    { frame ->
+                      converter.convert(frame.data, frame.width, frame.height)?.let {
+                        _frames.value = it
+                      }
+                    }
+                  }
+              cameraJobs +=
+                  viewModelScope.launch(Dispatchers.Default) { playOut(buffer, bufferMs, show) }
               cameraJobs += viewModelScope.launch {
                 // The state replays STOPPED on subscribe; only a STOPPED/CLOSED after the
                 // stream has been starting or running means it ended.
@@ -293,7 +367,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     StreamState.PAUSED -> _ui.update { it.copy(streaming = Phase.Paused) }
                     StreamState.STOPPED,
-                    StreamState.CLOSED -> if (active) closeCamera()
+                    StreamState.CLOSED -> if (active) cameraEnded()
                     else -> active = true // STARTING, STARTED, STOPPING
                   }
                 }
@@ -309,7 +383,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
                               "The glasses didn't start streaming. Check they're on, nearby and " +
                                   "not connected to another phone.")
                     }
-                    closeCamera()
+                    cameraEnded()
                   } else {
                     _ui.update { it.copy(message = error.description) }
                   }
@@ -322,7 +396,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   }
 
   private class TimedFrame(
-      val yuv: ByteArray,
+      val data: ByteArray, // I420 pixels, or one HEVC access unit in computer mode
       val width: Int,
       val height: Int,
       val ptsMs: Long, // capture time on the glasses' clock
@@ -337,7 +411,11 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
    * frames later than that are shown at once. Because the baseline is a recent minimum, a stall
    * never pushes the delay up for good: once delivery recovers, delay drops back to [delayMs].
    */
-  private suspend fun playOut(buffer: Channel<TimedFrame>, delayMs: Long) {
+  private suspend fun playOut(
+      buffer: Channel<TimedFrame>,
+      delayMs: Long,
+      show: (TimedFrame) -> Unit,
+  ) {
     val recent = ArrayDeque<TimedFrame>() // frames from the last BASELINE_WINDOW_MS, by arrival
     for (timed in buffer) {
       recent.addLast(timed)
@@ -346,8 +424,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
       val dueMs = timed.ptsMs + baseline + delayMs
       val now = SystemClock.elapsedRealtime()
       if (dueMs > now) delay(dueMs - now)
-      val bitmap = converter.convert(timed.yuv, timed.width, timed.height) ?: continue
-      _frames.value = bitmap
+      show(timed)
     }
   }
 
@@ -372,23 +449,30 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   }
 
   private fun closeCamera() {
-    wantCamera = false
     cameraJobs.forEach { it.cancel() }
     cameraJobs.clear()
     // Stopping the camera also detaches it, so the next open can add one with new settings.
     camera?.stop()
     camera = null
     _frames.value = null
-    _ui.update { it.copy(streaming = null) }
+  }
+
+  /** The stream ended on its own: back to waiting for a player in computer mode, else idle. */
+  private fun cameraEnded() {
+    closeCamera()
+    _ui.update { it.copy(streaming = if (server != null) Phase.Listening else null) }
   }
 
   private fun endSession() {
+    wantCamera = false
     closeCamera()
+    stopServer()
     sessionJobs.forEach { it.cancel() }
     sessionJobs.clear()
     session?.stop()
     session = null
     sessionStarted = false
+    _ui.update { it.copy(streaming = null, serverAddress = null, clientAddress = null) }
   }
 
   override fun onCleared() {

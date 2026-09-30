@@ -78,7 +78,7 @@ fun LiveScreen(
       // The camera view: a 9:16 frame (the glasses' feed is always portrait) between the system
       // bars. Frames are drawn onto the surface with a hardware canvas, off the main thread, so
       // the UI never redraws per frame; the viewfinder overlay sits on the same frame.
-      if (ui.streaming != null) {
+      if (ui.streaming != null && !ui.toComputer) {
         Box(Modifier.fillMaxSize().safeDrawingPadding(), contentAlignment = Alignment.Center) {
           Box(Modifier.aspectRatio(9f / 16f)) {
             AndroidExternalSurface(modifier = Modifier.fillMaxSize()) {
@@ -100,8 +100,9 @@ fun LiveScreen(
       }
 
       when (val phase = ui.phase) {
+        Phase.Listening,
         Phase.Live,
-        Phase.Paused -> Unit
+        Phase.Paused -> if (ui.toComputer) ComputerStatus(ui, settings, onClose = viewModel::stop)
         Phase.Ready ->
             CameraStart(
                 settings = settings,
@@ -192,6 +193,7 @@ private fun SetupContent(
       Phase.WaitingForGlasses -> Waiting("Waiting for glasses…\nTurn them on and keep them nearby.")
       Phase.Connecting -> Waiting("Starting camera…")
       Phase.Ready,
+      Phase.Listening,
       Phase.Live,
       Phase.Paused -> Unit
     }
@@ -276,6 +278,14 @@ private fun SettingsPanel(
           selected = settings.bufferMs,
           label = { "$it ms" },
           onSelect = { ms -> onChange { it.copy(bufferMs = ms) } },
+          stacked = stacked,
+      )
+      SettingRow(
+          title = "Show on",
+          options = listOf(false, true),
+          selected = settings.toComputer,
+          label = { if (it) "Computer" else "This phone" },
+          onSelect = { pc -> onChange { it.copy(toComputer = pc) } },
           stacked = stacked,
       )
       Text(
@@ -401,18 +411,104 @@ private fun Viewfinder(settings: StreamSettings, paused: Boolean, onClose: () ->
         }
       }
 
-      // Close: white ring with a white square.
-      Box(
-          contentAlignment = Alignment.Center,
-          modifier =
-              Modifier.align(Alignment.BottomCenter)
-                  .size(60.dp)
-                  .clip(CircleShape)
-                  .background(Scrim)
-                  .border(2.dp, Color.White, CircleShape)
-                  .clickable(onClickLabel = "Close camera", onClick = onClose),
-      ) {
-        Box(Modifier.size(18.dp).clip(RoundedCornerShape(4.dp)).background(Color.White))
+      CloseButton(onClose, Modifier.align(Alignment.BottomCenter))
+    }
+  }
+}
+
+/** Close: white ring with a white square. */
+@Composable
+private fun CloseButton(onClose: () -> Unit, modifier: Modifier = Modifier) {
+  Box(
+      contentAlignment = Alignment.Center,
+      modifier =
+          modifier
+              .size(60.dp)
+              .clip(CircleShape)
+              .background(Scrim)
+              .border(2.dp, Color.White, CircleShape)
+              .clickable(onClickLabel = "Close camera", onClick = onClose),
+  ) {
+    Box(Modifier.size(18.dp).clip(RoundedCornerShape(4.dp)).background(Color.White))
+  }
+}
+
+/** Status while the stream is served to a computer instead of drawn here. */
+@Composable
+private fun ComputerStatus(ui: LiveUiState, settings: StreamSettings, onClose: () -> Unit) {
+  // Keep the phone awake: the stream ends if the app leaves the screen.
+  val view = LocalView.current
+  DisposableEffect(Unit) {
+    view.keepScreenOn = true
+    onDispose { view.keepScreenOn = false }
+  }
+
+  val (dot, title, detail) =
+      when {
+        ui.phase == Phase.Paused ->
+            Triple(Held, "Paused on the glasses", "Tap the glasses' touchpad to resume.")
+        ui.clientAddress != null ->
+            Triple(Streaming, "Streaming to computer", ui.clientAddress ?: "")
+        else ->
+            Triple(
+                Faint,
+                "Waiting for a computer",
+                "Open the address below in a player. The glasses start streaming when it connects.",
+            )
+      }
+  val wifi = ui.serverAddress
+  val port = LiveViewModel.PORT
+  Column(
+      modifier =
+          Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 28.dp, vertical = 24.dp),
+      horizontalAlignment = Alignment.CenterHorizontally,
+  ) {
+    Spacer(Modifier.weight(1f))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+      Box(Modifier.size(10.dp).clip(CircleShape).background(dot))
+      Spacer(Modifier.width(10.dp))
+      Text(title, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+    }
+    Spacer(Modifier.height(8.dp))
+    Text(detail, color = Dim, fontSize = 14.sp, textAlign = TextAlign.Center)
+    Spacer(Modifier.height(28.dp))
+    Column(
+        Modifier.fillMaxWidth().widthIn(max = 480.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+      AddressLine("Wi-Fi", if (wifi != null) "tcp://$wifi" else "not on a network")
+      AddressLine("USB", "adb forward tcp:$port tcp:$port\ntcp://127.0.0.1:$port")
+      Text(
+          "ffplay -fflags nobuffer -flags low_delay -framerate ${settings.fps} -f hevc " +
+              "-i tcp://${wifi ?: "127.0.0.1:$port"}",
+          color = Faint,
+          fontSize = 11.sp,
+          fontFamily = FontFamily.Monospace,
+          modifier = Modifier.padding(top = 6.dp),
+      )
+    }
+    Spacer(Modifier.weight(1f))
+    SpecPill(settings)
+    Spacer(Modifier.height(20.dp))
+    CloseButton(onClose)
+  }
+}
+
+@Composable
+private fun AddressLine(label: String, value: String) {
+  Row(verticalAlignment = Alignment.Top) {
+    Text(label, color = Dim, fontSize = 13.sp, modifier = Modifier.width(56.dp))
+    // One line per address, shrinking on narrow screens rather than wrapping mid-address.
+    Column {
+      for (line in value.lines()) {
+        BasicText(
+            line,
+            style =
+                TextStyle(
+                    color = Color.White, fontSize = 13.sp, fontFamily = FontFamily.Monospace),
+            maxLines = 1,
+            autoSize = TextAutoSize.StepBased(minFontSize = 9.sp, maxFontSize = 13.sp),
+        )
       }
     }
   }

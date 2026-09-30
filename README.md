@@ -46,6 +46,28 @@ to portrait: on a foldable or tablet the video is centred at 9:16 in any orienta
 sit beside the shutter button on wide screens, and folding, unfolding or rotating mid-stream
 keeps the camera open. Tested on a Galaxy Z Fold3 (Android 15).
 
+## Streaming to a computer
+
+Set **Show on** to **Computer** and open the camera. The phone then listens on TCP port 5000 and
+shows its address; the glasses start streaming when a player connects and stop when it
+disconnects, so every connection begins cleanly with a keyframe. The glasses' compressed HEVC
+stream is passed on unchanged (raw Annex-B), paced by the same jitter buffer, so it costs the
+phone almost nothing and runs at ~0.5 Mbit/s.
+
+- **Same Wi-Fi network:** use the address the app shows, e.g. `tcp://192.168.1.23:5000`.
+- **USB:** with USB debugging on, run `adb forward tcp:5000 tcp:5000` on the computer, then use
+  `tcp://127.0.0.1:5000`. No network needed.
+
+Play it with ffplay (`-framerate` should match the frame rate you picked):
+
+```
+ffplay -fflags nobuffer -flags low_delay -framerate 24 -f hevc -i tcp://192.168.1.23:5000
+```
+
+or mpv (`mpv --profile=low-latency --untimed --demuxer-lavf-format=hevc tcp://192.168.1.23:5000`),
+or OBS: add a Media Source, untick *Local File*, input `tcp://192.168.1.23:5000`, input format
+`hevc`. Keep the app in the foreground on the phone; leaving it closes the stream.
+
 ## Smoother video: turn off background Bluetooth scanning
 
 Phones scan for nearby Bluetooth devices in the background, and while the radio listens the
@@ -74,3 +96,4 @@ mwdat_client_token=YOUR_CLIENT_TOKEN
 - `LiveViewModel.kt`: device session → camera → video stream lifecycle, and the jitter buffer
 - `I420Converter.kt`: converts decoded I420 frames to bitmaps
 - `LiveScreen.kt`: the whole UI, including drawing frames onto the video surface
+- `StreamServer.kt`: serves the compressed stream over TCP in computer mode
