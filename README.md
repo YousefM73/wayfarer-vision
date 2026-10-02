@@ -47,6 +47,9 @@ Chosen on the camera screen and remembered between launches; they apply when the
   smaller is closer to real time, larger rides out longer stalls, and 0 passes frames straight
   through, bunched as they arrive. Total glasses-to-screen delay is the buffer plus ~300 ms for
   the glasses, Bluetooth and decoding (measured ~0.6 s at 300 ms on a Galaxy Note 9).
+- **Show on**: this phone (default) or a computer, see [Streaming to a computer](#streaming-to-a-computer).
+- **Tracking**: off (default) or on, see [Tracking](#tracking). Greyed out until the MultiSet
+  keys and a map code are in settings.
 
 The stream is always portrait; the SDK has no landscape option. The app itself isn't locked
 to portrait: on a foldable or tablet the video is centred at 9:16 in any orientation, the settings
@@ -87,6 +90,43 @@ dropped from the middle of the stream, since each depends on the one before; if 
 behind, the server skips ahead to the next keyframe (the glasses send one every 3 seconds at 24 fps). Keep
 the app in the foreground on the phone; leaving it closes the stream.
 
+## Tracking
+
+With **Tracking** on, the viewfinder shows where the glasses are and which way they face inside
+a space you have mapped with [MultiSet](https://www.multiset.ai). Every few seconds the newest
+frame goes to MultiSet's visual positioning API, which matches it against the map and returns
+the camera's pose there:
+
+- **Position** in metres from the map's origin (right-handed, Y up), with the match confidence.
+- **Heading** as yaw, pitch and roll in degrees: turned right of the map's −Z axis, looking up,
+  and tilted toward the right shoulder are positive. The line ends in "· map" because it comes
+  from the map fix and so updates only as often as that does.
+
+Setup, under the cog on the camera screen:
+
+1. Map the space with MultiSet and wait for the map to become active. Scanning with their app
+   needs a LiDAR iPhone or iPad; scans from other hardware can be uploaded.
+2. Create a credential at developer.multiset.ai under Credentials. The Query scope is enough.
+3. Import the credentials CSV the portal lets you download, or type in the Client ID and Client
+   secret. Then enter the map's code (`MAP_...`, or `MSET_...` for a set of maps).
+4. Pick how often to update: every 1, 2, 5 (default) or 10 seconds, counted from the start of
+   one query to the start of the next. MultiSet puts a query at about a second, so 1 s means
+   one straight after another.
+
+The keys stay in the app's private storage on the phone, which isn't backed up.
+
+Limits:
+
+- Position needs **Show on: This phone**. In computer mode nothing is decoded on the phone, so
+  there is no picture to send.
+- Every update is one query against your MultiSet plan: 3,600 an hour at 1 s, 1,800 at 2 s,
+  720 at 5 s and 360 at 10 s. After a failed query the app waits at least 5 seconds.
+- The app also asks the glasses for their motion sensors (the SDK's beta Motion capability),
+  which would give head angles ten times a second. Ray-Ban Meta Gen 2 glasses in Developer Mode
+  on SDK 1.0.0 list the capability as available and accept the request, then send no samples,
+  so for now the heading comes from the map alone. If samples do arrive they take over the
+  heading line; their axis labels are untested.
+
 ## Less delay: give Bluetooth a clear radio
 
 The delay the buffer needs is set by how badly the Bluetooth link stalls, and that depends mostly
@@ -119,7 +159,10 @@ mwdat_client_token=YOUR_CLIENT_TOKEN
 ## Files
 
 - `MainActivity.kt`: Bluetooth permission, Meta AI registration and camera-permission hand-offs
-- `LiveViewModel.kt`: device session → camera → video stream lifecycle, and the jitter buffer
+- `LiveViewModel.kt`: device session → camera → video stream lifecycle, the jitter buffer, and
+  tracking
 - `I420Converter.kt`: converts decoded I420 frames to bitmaps
 - `LiveScreen.kt`: the whole UI, including drawing frames onto the video surface
 - `RtspServer.kt`: serves the compressed stream over RTSP in computer mode
+- `Tracking.kt`: MultiSet position queries, and head angles from a map fix or motion samples
+- `CredentialCsv.kt`: reads the credentials CSV from MultiSet's portal

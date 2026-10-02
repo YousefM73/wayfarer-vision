@@ -54,4 +54,5 @@ dependencies {
   implementation(libs.androidx.lifecycle.viewmodel.compose)
   implementation(libs.mwdat.core)
   implementation(libs.mwdat.camera)
+  implementation(libs.mwdat.motion)
 }

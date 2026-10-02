@@ -22,6 +22,12 @@ import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
 import com.meta.wearable.dat.core.types.RegistrationState
 import com.meta.wearable.dat.core.types.WearablesError
+import com.meta.wearable.dat.motion.Motion
+import com.meta.wearable.dat.motion.addMotion
+import com.meta.wearable.dat.motion.removeMotion
+import com.meta.wearable.dat.motion.types.MotionConfiguration
+import com.meta.wearable.dat.motion.types.MotionSamplingRate
+import com.meta.wearable.dat.motion.types.MotionState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
@@ -52,6 +58,7 @@ data class StreamSettings(
     val fps: Int = 24,
     val bufferMs: Long = AUTO_BUFFER, // smoothing delay in ms, or AUTO_BUFFER to size it live
     val toComputer: Boolean = false, // serve the compressed stream over RTSP instead of showing it
+    val tracking: Boolean = false, // position and heading from MultiSet; needs its keys
 ) {
   companion object {
     // Portrait frame sizes the SDK streams at each quality.
@@ -75,6 +82,7 @@ data class LiveUiState(
     val glassesUpdateRequired: Boolean = false,
     val streaming: Phase? = null, // Connecting, Listening, Live or Paused while a session is open
     val toComputer: Boolean = false, // what the open camera is doing
+    val tracking: Boolean = false, // whether the open camera tracks head and position
     val serverAddress: String? = null, // host:port on the local network, in computer mode
     val clientAddress: String? = null, // the connected player, in computer mode
     val message: String? = null,
@@ -112,6 +120,17 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
 
     // Port the RTSP server listens on in computer mode (554 is reserved for system apps).
     const val PORT = 8554
+
+    // After a position query fails, wait at least this long: at the fastest pace a wrong key or
+    // a dead network would otherwise mean a failing request every second.
+    private const val LOCATE_RETRY_MS = 5_000L
+
+    // Motion sensors: how long a start may take to produce its first sample, how long running
+    // sensors may go quiet, and how many restarts in a row to try before giving up.
+    private const val MOTION_START_MS = 5_000L
+    private const val MOTION_QUIET_MS = 3_000L
+    private const val MOTION_RESTARTS = 3
+    private const val MOTION_RESTART_PAUSE_MS = 750L
   }
 
   private val _ui = MutableStateFlow(LiveUiState())
@@ -127,6 +146,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
               fps = prefs.getInt("fps", 24),
               bufferMs = prefs.getLong("bufferMs", StreamSettings.AUTO_BUFFER),
               toComputer = prefs.getBoolean("toComputer", false),
+              tracking = prefs.getBoolean("tracking", false),
           ))
   val settings: StateFlow<StreamSettings> = _settings.asStateFlow()
 
@@ -158,6 +178,30 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   private val cameraJobs = mutableListOf<Job>()
   private var server: RtspServer? = null
   private var serverJob: Job? = null
+
+  private val _tracking = MutableStateFlow(TrackingState())
+
+  /** Head angles and map position while tracking is on. */
+  val tracking: StateFlow<TrackingState> = _tracking.asStateFlow()
+
+  private var motion: Motion? = null
+  private val trackingJobs = mutableListOf<Job>()
+  @Volatile private var motionSamples = 0L // received so far; shows whether the sensors are alive
+  @Volatile private var latestFrame: TimedFrame? = null // newest decoded frame, for location
+
+  private val _multiSet =
+      MutableStateFlow(
+          MultiSetConfig(
+              clientId = prefs.getString("multisetClientId", null).orEmpty(),
+              clientSecret = prefs.getString("multisetClientSecret", null).orEmpty(),
+              mapCode = prefs.getString("multisetMapCode", null).orEmpty(),
+              everySeconds =
+                  prefs.getInt("multisetEverySeconds", 0).takeIf { it in MultiSetConfig.INTERVALS }
+                      ?: MultiSetConfig().everySeconds,
+          ))
+
+  /** The MultiSet account and map typed into settings. Kept in this app's private storage. */
+  val multiSet: StateFlow<MultiSetConfig> = _multiSet.asStateFlow()
 
   fun initialize(context: Context) {
     if (_ui.value.sdkReady) return
@@ -194,6 +238,19 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
         .putInt("fps", next.fps)
         .putLong("bufferMs", next.bufferMs)
         .putBoolean("toComputer", next.toComputer)
+        .putBoolean("tracking", next.tracking)
+        .apply()
+  }
+
+  fun updateMultiSet(change: (MultiSetConfig) -> MultiSetConfig) {
+    val next = change(_multiSet.value)
+    _multiSet.value = next
+    prefs
+        .edit()
+        .putString("multisetClientId", next.clientId)
+        .putString("multisetClientSecret", next.clientSecret)
+        .putString("multisetMapCode", next.mapCode)
+        .putInt("multisetEverySeconds", next.everySeconds)
         .apply()
   }
 
@@ -208,11 +265,14 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   fun goLive(requestCameraPermission: suspend () -> PermissionStatus) {
     if (_ui.value.streaming != null) return
     wantCamera = true
-    opened = _settings.value
+    // Tracking can't be chosen without MultiSet keys; a choice saved before they were removed
+    // doesn't count either.
+    opened = _settings.value.let { it.copy(tracking = it.tracking && _multiSet.value.complete) }
     _ui.update {
       it.copy(
           streaming = Phase.Connecting,
           toComputer = opened.toComputer,
+          tracking = opened.tracking,
           glassesUpdateRequired = false,
           message = null,
       )
@@ -385,6 +445,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
                     val draw: (TimedFrame) -> Unit = { frame ->
                       if (frame.ptsMs >= lastPtsMs) {
                         lastPtsMs = frame.ptsMs
+                        if (opened.tracking) latestFrame = frame
                         converter.convert(frame.data, frame.width, frame.height)?.let {
                           _frames.value = it
                         }
@@ -403,6 +464,9 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
                     StreamState.STREAMING -> {
                       active = true
                       _ui.update { it.copy(streaming = Phase.Live) }
+                      // Not before: motion sensors asked for ahead of the first frames never
+                      // deliver a sample.
+                      if (opened.tracking) startTracking(session)
                     }
                     StreamState.PAUSED -> _ui.update { it.copy(streaming = Phase.Paused) }
                     StreamState.STOPPED,
@@ -432,6 +496,138 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
             },
             onFailure = { error, _ -> fail(error.description) },
         )
+  }
+
+  /**
+   * Position and heading from MultiSet, plus head angles from the glasses' own motion sensors
+   * should they send any. Current glasses accept that request and then stay silent.
+   */
+  private fun startTracking(session: DeviceSession) {
+    if (motion != null || trackingJobs.isNotEmpty()) return
+    _tracking.value = TrackingState()
+    session
+        .addMotion(MotionConfiguration(samplingRate = MotionSamplingRate.HZ_10))
+        .fold(
+            onSuccess = { added ->
+              motion = added
+              // Collect before start() so the first samples aren't missed.
+              trackingJobs +=
+                  viewModelScope.launch(Dispatchers.Default) {
+                    added.samples.collect { sample ->
+                      motionSamples++
+                      val head = headAngles(sample) ?: return@collect
+                      _tracking.update { it.copy(head = head, headNote = null) }
+                    }
+                  }
+              trackingJobs +=
+                  viewModelScope.launch {
+                    added.errors.collect { error ->
+                      if (error != null) {
+                        Log.w(TAG, "Motion error: ${error.description}")
+                        _tracking.update { it.copy(headNote = "Head: ${error.description}") }
+                      }
+                    }
+                  }
+              trackingJobs += viewModelScope.launch { keepMotionAlive(added) }
+              added.start()
+            },
+            onFailure = { error, _ ->
+              Log.w(TAG, "Motion unavailable: ${error.description}")
+              _tracking.update { it.copy(headNote = "Head tracking unavailable") }
+            },
+        )
+    trackingJobs += viewModelScope.launch(Dispatchers.IO) { locate() }
+  }
+
+  /**
+   * Restarts the motion sensors when they go quiet. The glasses drop them without a word when
+   * the camera restarts, which it also does to switch resolution, and a start that never yields
+   * a sample stays "starting" for good: the SDK has no timeout for it.
+   */
+  private suspend fun keepMotionAlive(motion: Motion) {
+    var seen = motionSamples
+    var quietSince = SystemClock.elapsedRealtime()
+    var restarts = 0 // in a row, with no sample in between
+    while (true) {
+      delay(1_000)
+      val now = SystemClock.elapsedRealtime()
+      val state = motion.state.value
+      // Paused sensors resume by themselves, with the session or the stream that paused them.
+      val paused = state == MotionState.PAUSED || _ui.value.streaming == Phase.Paused
+      if (motionSamples != seen || paused) {
+        if (motionSamples != seen) restarts = 0
+        seen = motionSamples
+        quietSince = now
+        continue
+      }
+      val patience = if (state == MotionState.STARTING) MOTION_START_MS else MOTION_QUIET_MS
+      if (now - quietSince < patience) continue
+      if (restarts == MOTION_RESTARTS) {
+        Log.w(TAG, "Motion: still no samples after $restarts restarts")
+        _tracking.update { it.copy(head = null, headNote = "Head: no data from the glasses") }
+        return
+      }
+      restarts++
+      Log.w(TAG, "Motion: no samples for ${now - quietSince} ms while $state; restart $restarts")
+      _tracking.update { it.copy(head = null) }
+      motion.stop() // synchronous; a start() is ignored unless the sensors are stopped
+      delay(MOTION_RESTART_PAUSE_MS)
+      motion.start()
+      quietSince = SystemClock.elapsedRealtime()
+    }
+  }
+
+  /** Asks MultiSet where the newest frame was taken, every few seconds while frames arrive. */
+  private suspend fun locate() {
+    if (opened.toComputer) {
+      // Nothing is decoded on the phone in computer mode, so there is no picture to send.
+      _tracking.update { it.copy(locationNote = "Location needs Show on: This phone") }
+      return
+    }
+    val config = _multiSet.value
+    val client = MultiSetClient(config)
+    _tracking.update { it.copy(locationNote = "Locating…") }
+    var sent: TimedFrame? = null
+    while (true) {
+      val frame = latestFrame
+      // Nothing new to ask about: no frame yet, or the stream is paused on the last one.
+      if (frame == null || frame === sent) {
+        delay(200)
+        continue
+      }
+      sent = frame
+      val startedMs = SystemClock.elapsedRealtime()
+      var everyMs = config.everySeconds * 1_000L
+      val jpeg = i420ToJpeg(frame.data, frame.width, frame.height)
+      when (val fix = client.locate(jpeg, frame.width, frame.height)) {
+        is MultiSetClient.Fix.Found ->
+            _tracking.update { it.copy(pose = fix.pose, locationNote = null) }
+        is MultiSetClient.Fix.NotFound ->
+            _tracking.update { it.copy(locationNote = "no match in the map") }
+        is MultiSetClient.Fix.Failed -> {
+          Log.w(TAG, "MultiSet query failed: ${fix.reason}")
+          _tracking.update { it.copy(locationNote = "Location: ${fix.reason}") }
+          everyMs = maxOf(everyMs, LOCATE_RETRY_MS)
+        }
+      }
+      // Paced from one query's start to the next, so a slow reply eats into the wait rather
+      // than adding to it.
+      delay((startedMs + everyMs - SystemClock.elapsedRealtime()).coerceAtLeast(0))
+    }
+  }
+
+  private fun stopTracking() {
+    trackingJobs.forEach { it.cancel() }
+    trackingJobs.clear()
+    motion?.let {
+      it.stop()
+      session?.removeMotion()?.onFailure { error, _ ->
+        Log.w(TAG, "Couldn't remove motion: ${error.description}")
+      }
+    }
+    motion = null
+    latestFrame = null
+    _tracking.value = TrackingState()
   }
 
   private class TimedFrame(
@@ -515,6 +711,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   private fun closeCamera() {
     cameraJobs.forEach { it.cancel() }
     cameraJobs.clear()
+    stopTracking() // it runs alongside the stream
     // Stopping the camera also detaches it, so the next open can add one with new settings.
     camera?.stop()
     camera = null
