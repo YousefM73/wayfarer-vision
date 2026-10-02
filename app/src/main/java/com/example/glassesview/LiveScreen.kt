@@ -54,6 +54,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 
 private val Dim = Color.White.copy(alpha = 0.6f)
@@ -93,7 +94,12 @@ fun LiveScreen(
               }
             }
             if (ui.phase == Phase.Live || ui.phase == Phase.Paused) {
-              Viewfinder(settings, paused = ui.phase == Phase.Paused, onClose = viewModel::stop)
+              Viewfinder(
+                  settings,
+                  viewModel.bufferNow,
+                  paused = ui.phase == Phase.Paused,
+                  onClose = viewModel::stop,
+              )
             }
           }
         }
@@ -102,7 +108,10 @@ fun LiveScreen(
       when (val phase = ui.phase) {
         Phase.Listening,
         Phase.Live,
-        Phase.Paused -> if (ui.toComputer) ComputerStatus(ui, settings, onClose = viewModel::stop)
+        Phase.Paused ->
+            if (ui.toComputer) {
+              ComputerStatus(ui, settings, viewModel.bufferNow, onClose = viewModel::stop)
+            }
         Phase.Ready ->
             CameraStart(
                 settings = settings,
@@ -180,7 +189,9 @@ private fun SetupContent(
       }
       Phase.Registering -> Waiting("Finish linking in Meta AI…")
       Phase.GlassesUpdateRequired -> {
-        Hint("Your glasses need Meta's toolkit installed or updated before they can stream.")
+        Hint(
+            "Your glasses didn't answer. Put them on and try again, or restart them with their " +
+                "power switch. If it keeps happening, reinstall Meta's toolkit from Meta AI.")
         PillButton("Update glasses", onUpdateGlasses)
         Spacer(Modifier.height(12.dp))
         Text(
@@ -268,15 +279,15 @@ private fun SettingsPanel(
           title = "Frame rate",
           options = StreamSettings.FRAME_RATES,
           selected = settings.fps,
-          label = { "$it fps" },
+          label = { it.toString() },
           onSelect = { fps -> onChange { it.copy(fps = fps) } },
           stacked = stacked,
       )
       SettingRow(
-          title = "Buffer",
+          title = "Buffer (ms)",
           options = StreamSettings.BUFFERS,
           selected = settings.bufferMs,
-          label = { "$it ms" },
+          label = { if (it == StreamSettings.AUTO_BUFFER) "Auto" else it.toString() },
           onSelect = { ms -> onChange { it.copy(bufferMs = ms) } },
           stacked = stacked,
       )
@@ -289,7 +300,7 @@ private fun SettingsPanel(
           stacked = stacked,
       )
       Text(
-          "A smaller buffer is closer to real time; a larger one rides out Bluetooth hiccups.",
+          "Lower frame rate and quality keep the glasses cooler.",
           color = Faint,
           fontSize = 12.sp,
           modifier = Modifier.padding(top = 2.dp),
@@ -319,7 +330,7 @@ private fun <T> SettingRow(
           style = TextStyle(color = Dim, fontSize = 13.sp),
           maxLines = 1,
           autoSize = TextAutoSize.StepBased(minFontSize = 10.sp, maxFontSize = 13.sp),
-          modifier = Modifier.width(84.dp),
+          modifier = Modifier.width(100.dp),
       )
       Chips(options, selected, label, onSelect, Modifier.weight(1f))
     }
@@ -370,7 +381,12 @@ private fun <T> Chips(
 
 /** Overlay on the camera frame: framing marks, status and specs, and a close control. */
 @Composable
-private fun Viewfinder(settings: StreamSettings, paused: Boolean, onClose: () -> Unit) {
+private fun Viewfinder(
+    settings: StreamSettings,
+    bufferNow: StateFlow<Long>,
+    paused: Boolean,
+    onClose: () -> Unit,
+) {
   // Keep the screen awake while watching.
   val view = LocalView.current
   DisposableEffect(Unit) {
@@ -400,13 +416,13 @@ private fun Viewfinder(settings: StreamSettings, paused: Boolean, onClose: () ->
           // Narrow frame (a fold's cover screen, or unfolded and held sideways): stack the pills.
           Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             StatusPill(paused)
-            SpecPill(settings)
+            SpecPill(settings, bufferNow)
           }
         } else {
           Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             StatusPill(paused)
             Spacer(Modifier.weight(1f))
-            SpecPill(settings)
+            SpecPill(settings, bufferNow)
           }
         }
       }
@@ -435,7 +451,12 @@ private fun CloseButton(onClose: () -> Unit, modifier: Modifier = Modifier) {
 
 /** Status while the stream is served to a computer instead of drawn here. */
 @Composable
-private fun ComputerStatus(ui: LiveUiState, settings: StreamSettings, onClose: () -> Unit) {
+private fun ComputerStatus(
+    ui: LiveUiState,
+    settings: StreamSettings,
+    bufferNow: StateFlow<Long>,
+    onClose: () -> Unit,
+) {
   // Keep the phone awake: the stream ends if the app leaves the screen.
   val view = LocalView.current
   DisposableEffect(Unit) {
@@ -453,7 +474,7 @@ private fun ComputerStatus(ui: LiveUiState, settings: StreamSettings, onClose: (
             Triple(
                 Faint,
                 "Waiting for a computer",
-                "Open the address below in a player. The glasses start streaming when it connects.",
+                "Open the address below in VLC or OBS. The glasses start streaming when it plays.",
             )
       }
   val wifi = ui.serverAddress
@@ -476,19 +497,17 @@ private fun ComputerStatus(ui: LiveUiState, settings: StreamSettings, onClose: (
         Modifier.fillMaxWidth().widthIn(max = 480.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-      AddressLine("Wi-Fi", if (wifi != null) "tcp://$wifi" else "not on a network")
-      AddressLine("USB", "adb forward tcp:$port tcp:$port\ntcp://127.0.0.1:$port")
+      AddressLine("Wi-Fi", if (wifi != null) "rtsp://$wifi/live" else "not on a network")
+      AddressLine("USB", "adb forward tcp:$port tcp:$port\nrtsp://127.0.0.1:$port/live")
       Text(
-          "ffplay -fflags nobuffer -flags low_delay -framerate ${settings.fps} -f hevc " +
-              "-i tcp://${wifi ?: "127.0.0.1:$port"}",
+          "VLC: Media › Open Network Stream. OBS: Media Source, Local File off.",
           color = Faint,
-          fontSize = 11.sp,
-          fontFamily = FontFamily.Monospace,
+          fontSize = 12.sp,
           modifier = Modifier.padding(top = 6.dp),
       )
     }
     Spacer(Modifier.weight(1f))
-    SpecPill(settings)
+    SpecPill(settings, bufferNow)
     Spacer(Modifier.height(20.dp))
     CloseButton(onClose)
   }
@@ -536,10 +555,18 @@ private fun StatusPill(paused: Boolean) {
 }
 
 @Composable
-private fun SpecPill(settings: StreamSettings) {
+private fun SpecPill(settings: StreamSettings, bufferNow: StateFlow<Long>) {
   val (w, h) = StreamSettings.QUALITIES.getValue(settings.quality)
+  val buffer =
+      if (settings.bufferMs == StreamSettings.AUTO_BUFFER) {
+        // On auto, show the delay the link currently needs.
+        val now by bufferNow.collectAsStateWithLifecycle()
+        "auto $now ms"
+      } else {
+        "${settings.bufferMs} ms"
+      }
   BasicText(
-      "$w×$h · ${settings.fps} fps · ${settings.bufferMs} ms",
+      "$w×$h · ${settings.fps} fps · $buffer",
       style = TextStyle(color = Dim, fontSize = 11.sp, fontFamily = FontFamily.Monospace),
       maxLines = 1,
       autoSize = TextAutoSize.StepBased(minFontSize = 9.sp, maxFontSize = 11.sp),

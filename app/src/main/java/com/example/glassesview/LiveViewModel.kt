@@ -50,8 +50,8 @@ enum class Phase {
 data class StreamSettings(
     val quality: VideoQuality = VideoQuality.MEDIUM,
     val fps: Int = 24,
-    val bufferMs: Long = 200,
-    val toComputer: Boolean = false, // serve the compressed stream over TCP instead of showing it
+    val bufferMs: Long = AUTO_BUFFER, // smoothing delay in ms, or AUTO_BUFFER to size it live
+    val toComputer: Boolean = false, // serve the compressed stream over RTSP instead of showing it
 ) {
   companion object {
     // Portrait frame sizes the SDK streams at each quality.
@@ -61,8 +61,9 @@ data class StreamSettings(
             VideoQuality.MEDIUM to (504 to 896),
             VideoQuality.HIGH to (720 to 1280),
         )
-    val FRAME_RATES = listOf(15, 24, 30) // the SDK also accepts 2 and 7
-    val BUFFERS = listOf(100L, 200L, 300L)
+    val FRAME_RATES = listOf(2, 7, 15, 24, 30) // every rate the SDK accepts; lower runs cooler
+    const val AUTO_BUFFER = -1L
+    val BUFFERS = listOf(AUTO_BUFFER, 0L, 100L, 200L, 300L, 500L)
   }
 }
 
@@ -96,11 +97,21 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   companion object {
     private const val TAG = "GlassesView"
 
-    // How far back the jitter buffer looks for its fastest-delivery baseline.
-    private const val BASELINE_WINDOW_MS = 3_000L
+    // How far back the jitter buffer looks: for its fastest-delivery baseline and, in auto mode,
+    // for how late frames have been arriving.
+    private const val WINDOW_MS = 10_000L
 
-    // TCP port the compressed stream is served on in computer mode.
-    const val PORT = 5000
+    // Auto buffer: cover all but the latest few percent of recent frames, within sane bounds.
+    private const val AUTO_PERCENTILE = 97
+    private const val AUTO_MARGIN_MS = 20L
+    private const val AUTO_MIN_MS = 60L
+    private const val AUTO_MAX_MS = 800L
+    private const val AUTO_START_MS = 200L // until there is some history to go on
+    private const val AUTO_MIN_SAMPLES = 15
+    private const val AUTO_RETUNE_FRAMES = 12
+
+    // Port the RTSP server listens on in computer mode (554 is reserved for system apps).
+    const val PORT = 8554
   }
 
   private val _ui = MutableStateFlow(LiveUiState())
@@ -114,7 +125,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
                   VideoQuality.entries.firstOrNull { it.name == prefs.getString("quality", null) }
                       ?: VideoQuality.MEDIUM,
               fps = prefs.getInt("fps", 24),
-              bufferMs = prefs.getLong("bufferMs", 200),
+              bufferMs = prefs.getLong("bufferMs", StreamSettings.AUTO_BUFFER),
               toComputer = prefs.getBoolean("toComputer", false),
           ))
   val settings: StateFlow<StreamSettings> = _settings.asStateFlow()
@@ -128,6 +139,14 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   /** The latest frame to draw, published at its playback time. */
   val frames: StateFlow<Bitmap?> = _frames.asStateFlow()
 
+  private val _bufferNow = MutableStateFlow(0L)
+
+  /** The smoothing delay in use right now, in ms; it moves while the buffer is on auto. */
+  val bufferNow: StateFlow<Long> = _bufferNow.asStateFlow()
+
+  // Where the auto buffer left off, so the next open starts from a delay that suited this link.
+  @Volatile private var autoDelayMs = AUTO_START_MS
+
   // The session with the glasses stays open between camera views and only the camera is added and
   // removed. Ending a session makes the SDK report the glasses as disconnected for a while, which
   // would fail the next open.
@@ -137,7 +156,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   private var camera: Camera? = null
   private var wantCamera = false
   private val cameraJobs = mutableListOf<Job>()
-  private var server: StreamServer? = null
+  private var server: RtspServer? = null
   private var serverJob: Job? = null
 
   fun initialize(context: Context) {
@@ -246,15 +265,15 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
 
   private fun startServer(session: DeviceSession) {
     if (server != null) return
-    val started = StreamServer(PORT, viewModelScope).also { server = it }
+    val started = RtspServer(PORT, viewModelScope).also { server = it }
     started.start()
     _ui.update {
       it.copy(
           streaming = Phase.Listening,
-          serverAddress = StreamServer.localAddress()?.let { ip -> "$ip:$PORT" },
+          serverAddress = RtspServer.localAddress()?.let { ip -> "$ip:$PORT" },
       )
     }
-    // The glasses stream only while a player is connected: each connection gets a fresh stream
+    // The glasses stream only while a player is playing: each one gets a fresh stream
     // (parameter sets and a keyframe first), and the glasses stay cool while nobody is watching.
     serverJob =
         viewModelScope.launch {
@@ -284,8 +303,12 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
               // Subscribe before start() so no transition is missed.
               sessionJobs += viewModelScope.launch {
                 created.errors.collect { error ->
-                  if (error == DeviceSessionError.DAT_APP_ON_THE_GLASSES_UPDATE_REQUIRED) {
-                    // The toolkit app on the glasses is missing or too old; Meta AI installs it.
+                  // The toolkit app on the glasses is missing or too old; Meta AI installs it.
+                  // The SDK often reports that refusal as a plain "ended by device" before the
+                  // session ever starts, so treat that the same way.
+                  val refused =
+                      error == DeviceSessionError.SESSION_ENDED_BY_DEVICE && !sessionStarted
+                  if (error == DeviceSessionError.DAT_APP_ON_THE_GLASSES_UPDATE_REQUIRED || refused) {
                     Log.w(TAG, error.description)
                     endSession()
                     _ui.update { it.copy(glassesUpdateRequired = true, message = null) }
@@ -325,11 +348,20 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
             onSuccess = { added ->
               camera = added
               val stream = added.stream
-              val buffer = Channel<TimedFrame>(64, BufferOverflow.DROP_OLDEST)
-              cameraJobs += viewModelScope.launch(Dispatchers.Default) {
+              // Decoded frames are big and independent, so cap the queue and shed the oldest.
+              // Compressed frames are small and each depends on the last, so never shed any.
+              val buffer =
+                  if (opened.toComputer) Channel<TimedFrame>(Channel.UNLIMITED)
+                  else Channel<TimedFrame>(64, BufferOverflow.DROP_OLDEST)
+              // A compressed frame arrives wrapped around the transport's own buffer, which is
+              // reused for the next frame as soon as the SDK's callback returns. So the copy has
+              // to happen inside that callback: collecting unconfined runs this block within the
+              // SDK's emit, on its thread. On any other dispatcher the copy runs late and picks
+              // up the following frame's bytes; that loses a reference frame and smears the
+              // picture until the next keyframe.
+              cameraJobs += viewModelScope.launch(Dispatchers.Unconfined) {
                 stream.videoStream.collect { frame ->
                   if (frame.isCompressed != opened.toComputer) return@collect
-                  // Copy out of the SDK's buffer, which it may reuse after this returns.
                   val src = frame.buffer.duplicate()
                   val bytes = ByteArray(src.remaining()).also { src.get(it) }
                   buffer.trySend(
@@ -345,13 +377,20 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
               val bufferMs = opened.bufferMs
               val show: (TimedFrame) -> Unit =
                   if (opened.toComputer) {
-                    { frame -> server?.send(frame.data) }
+                    { frame -> server?.send(frame.data, frame.ptsMs) }
                   } else {
-                    { frame ->
-                      converter.convert(frame.data, frame.width, frame.height)?.let {
-                        _frames.value = it
+                    // The SDK delivers decoded frames from a thread pool, so two can swap
+                    // places. Showing the older one second would step back in time; skip it.
+                    var lastPtsMs = Long.MIN_VALUE
+                    val draw: (TimedFrame) -> Unit = { frame ->
+                      if (frame.ptsMs >= lastPtsMs) {
+                        lastPtsMs = frame.ptsMs
+                        converter.convert(frame.data, frame.width, frame.height)?.let {
+                          _frames.value = it
+                        }
                       }
                     }
+                    draw
                   }
               cameraJobs +=
                   viewModelScope.launch(Dispatchers.Default) { playOut(buffer, bufferMs, show) }
@@ -405,22 +444,47 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
 
   /**
    * Jitter buffer. Frames leave the glasses at a steady rate but arrive over Bluetooth in bunches.
-   * Each frame's transport delay is `arrived - pts` (plus an unknown clock offset); the fastest
-   * delivery over the last few seconds is the baseline. A frame is shown [delayMs] after the time
-   * it would have arrived at that baseline, so bunched frames play back at their capture pace, and
-   * frames later than that are shown at once. Because the baseline is a recent minimum, a stall
-   * never pushes the delay up for good: once delivery recovers, delay drops back to [delayMs].
+   * Each frame's transit time is `arrived - pts` (its transport delay plus a constant clock
+   * offset); the fastest delivery over the last [WINDOW_MS] is the baseline. A frame is shown a
+   * fixed delay after the time it would have arrived at that baseline, so bunched frames play
+   * back at their capture pace, and frames later than that are shown at once. Because the
+   * baseline is a recent minimum, a stall never pushes the delay up for good.
+   *
+   * [setting] is that delay in ms, or [StreamSettings.AUTO_BUFFER] to size it from the link: the
+   * delay then follows how late recent frames actually were (their [AUTO_PERCENTILE]th
+   * percentile), growing at once when stalls get longer and shrinking a millisecond per frame,
+   * too slowly to see, when the link clears up.
    */
   private suspend fun playOut(
       buffer: Channel<TimedFrame>,
-      delayMs: Long,
+      setting: Long,
       show: (TimedFrame) -> Unit,
   ) {
-    val recent = ArrayDeque<TimedFrame>() // frames from the last BASELINE_WINDOW_MS, by arrival
+    val auto = setting == StreamSettings.AUTO_BUFFER
+    var delayMs = if (auto) autoDelayMs else setting
+    var autoTarget = delayMs
+    var sinceRetune = 0
+    _bufferNow.value = delayMs
+    // (arrival time, transit) of the frames from the last WINDOW_MS. Only these two numbers are
+    // kept, not the frames, which would pin seconds of video in memory.
+    val recent = ArrayDeque<LongArray>()
     for (timed in buffer) {
-      recent.addLast(timed)
-      while (recent.first().arrivedMs < timed.arrivedMs - BASELINE_WINDOW_MS) recent.removeFirst()
-      val baseline = recent.minOf { it.arrivedMs - it.ptsMs }
+      val transit = timed.arrivedMs - timed.ptsMs
+      recent.addLast(longArrayOf(timed.arrivedMs, transit))
+      while (recent.first()[0] < timed.arrivedMs - WINDOW_MS) recent.removeFirst()
+      val baseline = recent.minOf { it[1] }
+      if (auto) {
+        if (++sinceRetune >= AUTO_RETUNE_FRAMES && recent.size >= AUTO_MIN_SAMPLES) {
+          sinceRetune = 0
+          val lateness = LongArray(recent.size) { recent[it][1] - baseline }.also { it.sort() }
+          autoTarget =
+              (lateness[(lateness.size - 1) * AUTO_PERCENTILE / 100] + AUTO_MARGIN_MS)
+                  .coerceIn(AUTO_MIN_MS, AUTO_MAX_MS)
+        }
+        delayMs = if (autoTarget > delayMs) autoTarget else maxOf(autoTarget, delayMs - 1)
+        autoDelayMs = delayMs
+        _bufferNow.value = delayMs / 10 * 10 // steps of 10 ms are plenty for a readout
+      }
       val dueMs = timed.ptsMs + baseline + delayMs
       val now = SystemClock.elapsedRealtime()
       if (dueMs > now) delay(dueMs - now)
