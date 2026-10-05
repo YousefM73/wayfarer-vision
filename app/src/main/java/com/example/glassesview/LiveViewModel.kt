@@ -177,7 +177,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
   private var wantCamera = false
   private val cameraJobs = mutableListOf<Job>()
   private var server: RtspServer? = null
-  private var serverJob: Job? = null
+  private val serverJobs = mutableListOf<Job>()
 
   private val _tracking = MutableStateFlow(TrackingState())
 
@@ -268,6 +268,11 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
     // Tracking can't be chosen without MultiSet keys; a choice saved before they were removed
     // doesn't count either.
     opened = _settings.value.let { it.copy(tracking = it.tracking && _multiSet.value.complete) }
+    if (opened.toComputer) {
+      // Started now, while the app is on screen: Android won't start a foreground service from
+      // the background, and the app may be off screen by the time the session is up.
+      StreamService.start(getApplication(), "Starting camera…", "")
+    }
     _ui.update {
       it.copy(
           streaming = Phase.Connecting,
@@ -303,9 +308,13 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
     _ui.update { it.copy(streaming = null, serverAddress = null, clientAddress = null) }
   }
 
-  /** The app left the screen: don't keep streaming in the background. */
+  /**
+   * The app left the screen. In phone mode there is nothing to show then, so the camera closes.
+   * In computer mode streaming carries on under [StreamService], with the screen off or another
+   * app in front, until Stop is tapped here or on its notification.
+   */
   fun onBackground() {
-    if (_ui.value.streaming != null) stop()
+    if (_ui.value.streaming != null && !opened.toComputer) stop()
   }
 
   private fun startCamera() {
@@ -327,32 +336,37 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
     if (server != null) return
     val started = RtspServer(PORT, viewModelScope).also { server = it }
     started.start()
-    _ui.update {
-      it.copy(
-          streaming = Phase.Listening,
-          serverAddress = RtspServer.localAddress()?.let { ip -> "$ip:$PORT" },
-      )
-    }
+    val address = RtspServer.localAddress()?.let { ip -> "$ip:$PORT" }
+    _ui.update { it.copy(streaming = Phase.Listening, serverAddress = address) }
+    // The notification says where to connect, and its Stop ends the stream from anywhere.
+    val app = getApplication<Application>()
+    val waiting =
+        "Waiting for a computer" to (address?.let { "rtsp://$it/live" } ?: "Not on a network")
+    StreamService.update(app, waiting.first, waiting.second)
+    serverJobs += viewModelScope.launch { StreamService.stopRequests.collect { stop() } }
     // The glasses stream only while a player is playing: each one gets a fresh stream
     // (parameter sets and a keyframe first), and the glasses stay cool while nobody is watching.
-    serverJob =
+    serverJobs +=
         viewModelScope.launch {
           started.client.collect { client ->
             _ui.update { it.copy(clientAddress = client) }
             if (client != null) {
+              StreamService.update(app, "Streaming to computer", client)
               if (camera == null) attachCamera(session)
-            } else if (camera != null) {
-              cameraEnded()
+            } else {
+              StreamService.update(app, waiting.first, waiting.second)
+              if (camera != null) cameraEnded()
             }
           }
         }
   }
 
   private fun stopServer() {
-    serverJob?.cancel()
-    serverJob = null
+    serverJobs.forEach { it.cancel() }
+    serverJobs.clear()
     server?.stop()
     server = null
+    StreamService.stop(getApplication())
   }
 
   private fun openSession() {

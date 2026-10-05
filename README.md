@@ -87,8 +87,15 @@ Bluetooth stalls (24 fps, late pictures per 20 s): Auto with VLC's defaults 0; A
 RTP is carried over the RTSP connection itself (TCP); a player that asks for UDP is told to
 retry over TCP, which VLC, OBS and ffmpeg do on their own. One player at a time. Frames are never
 dropped from the middle of the stream, since each depends on the one before; if a player falls
-behind, the server skips ahead to the next keyframe (the glasses send one every 3 seconds at 24 fps). Keep
-the app in the foreground on the phone; leaving it closes the stream.
+behind, the server skips ahead to the next keyframe (the glasses send one every 3 seconds at 24 fps).
+
+The stream keeps running with the screen off or another app in front: while the camera is open
+in computer mode the app runs a foreground service that keeps the phone's CPU and Wi-Fi awake,
+and its notification shows the address and has a Stop button. Android 13 and later ask once
+whether the app may show notifications; streaming works either way, but without the notification
+the stream can only be stopped from the app. Swiping the app away from recents ends the stream.
+In phone mode the camera still closes when the app leaves the screen, since there is nothing to
+show.
 
 ## Tracking
 

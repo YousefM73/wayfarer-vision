@@ -546,13 +546,6 @@ private fun ComputerStatus(
     tracking: StateFlow<TrackingState>,
     onClose: () -> Unit,
 ) {
-  // Keep the phone awake: the stream ends if the app leaves the screen.
-  val view = LocalView.current
-  DisposableEffect(Unit) {
-    view.keepScreenOn = true
-    onDispose { view.keepScreenOn = false }
-  }
-
   val (dot, title, detail) =
       when {
         ui.phase == Phase.Paused ->
@@ -581,6 +574,14 @@ private fun ComputerStatus(
     }
     Spacer(Modifier.height(8.dp))
     Text(detail, color = Dim, fontSize = 14.sp, textAlign = TextAlign.Center)
+    Spacer(Modifier.height(6.dp))
+    Text(
+        "Keeps going with the screen off or another app in front. Stop it here or from the " +
+            "notification.",
+        color = Faint,
+        fontSize = 12.sp,
+        textAlign = TextAlign.Center,
+    )
     if (ui.tracking) {
       Spacer(Modifier.height(16.dp))
       TrackingReadout(tracking)

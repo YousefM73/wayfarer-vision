@@ -1,6 +1,7 @@
 package com.example.glassesview
 
 import android.Manifest.permission.BLUETOOTH_CONNECT
+import android.Manifest.permission.POST_NOTIFICATIONS
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
@@ -44,6 +45,22 @@ class MainActivity : ComponentActivity() {
         cameraPermission.launch(Permission.CAMERA)
       }
 
+  // Android 13+ shows the streaming notification, with its Stop button, only once allowed.
+  // Streaming works either way, so the answer doesn't matter here.
+  private val notificationPermission =
+      registerForActivityResult(RequestPermission()) { viewModel.goLive(::requestCameraPermission) }
+
+  /** Opens the camera; in computer mode, after asking to show notifications the first time. */
+  private fun openCamera() {
+    val ask =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            viewModel.settings.value.toComputer &&
+            ContextCompat.checkSelfPermission(this, POST_NOTIFICATIONS) !=
+                PackageManager.PERMISSION_GRANTED
+    if (ask) notificationPermission.launch(POST_NOTIFICATIONS)
+    else viewModel.goLive(::requestCameraPermission)
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     enableEdgeToEdge(
@@ -55,7 +72,7 @@ class MainActivity : ComponentActivity() {
           viewModel = viewModel,
           onGrantBluetooth = ::ensureBluetoothPermission,
           onConnect = { Wearables.startRegistration(this) },
-          onOpenCamera = { viewModel.goLive(::requestCameraPermission) },
+          onOpenCamera = ::openCamera,
           onUpdateGlasses = {
             Wearables.openDATGlassesAppUpdate(this).onFailure { error, _ ->
               viewModel.showMessage("Couldn't open Meta AI ($error). Update from its settings.")
